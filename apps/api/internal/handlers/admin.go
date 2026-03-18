@@ -1,0 +1,904 @@
+package handlers
+
+import (
+	"context"
+	"encoding/csv"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+
+	"triageguard/apps/api/internal/db"
+	"triageguard/apps/api/internal/linear"
+)
+
+func parseWindowDays(raw string) int {
+	windowDays := 30
+	if parsed, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil && (parsed == 7 || parsed == 30 || parsed == 90) {
+		windowDays = parsed
+	}
+	return windowDays
+}
+
+func csvTimeValue(v *time.Time) string {
+	if v == nil {
+		return ""
+	}
+	return v.UTC().Format(time.RFC3339)
+}
+
+func csvFloatValue(v *float64) string {
+	if v == nil {
+		return ""
+	}
+	return strconv.FormatFloat(*v, 'f', 2, 64)
+}
+
+func (a *App) workspaceHasEnterprise(ctx context.Context, workspaceID uuid.UUID) (bool, error) {
+	allowed, plan, _, err := a.workspaceHasPaidAccess(ctx, workspaceID)
+	if err != nil {
+		return false, err
+	}
+	return allowed && plan == planEnterprise, nil
+}
+
+func (a *App) handleGetMe(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	policy, _ := a.store.GetPolicy(r.Context(), workspace.ID)
+	_, slackErr := a.store.GetSlackInstallationByWorkspace(r.Context(), workspace.ID)
+	_, linearErr := a.store.GetLinearInstallation(r.Context(), workspace.ID)
+	subscription, _ := a.store.GetWorkspaceSubscriptionOrDefault(r.Context(), workspace.ID)
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"workspace": workspace,
+		"integrations": map[string]any{
+			"slack_connected":  slackErr == nil,
+			"linear_connected": linearErr == nil,
+		},
+		"policy": policy,
+		"billing": map[string]any{
+			"plan_key":             normalizePlanKey(subscription.PlanKey),
+			"status":               strings.ToLower(strings.TrimSpace(subscription.Status)),
+			"billing_provider":     normalizeBillingProvider(subscription.BillingProvider),
+			"effective_plan":       effectivePlan(subscription),
+			"cancel_at_period_end": subscription.CancelAtPeriodEnd,
+			"current_period_end":   subscription.CurrentPeriodEnd,
+		},
+	})
+}
+
+func (a *App) handleListChannels(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	channels, err := a.store.ListChannels(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"channels": channels})
+}
+
+func (a *App) handleSyncChannels(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	install, err := a.store.GetSlackInstallationByWorkspace(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "slack is not connected"})
+		return
+	}
+	channels, err := a.slackClient.ListConversations(r.Context(), install.BotToken)
+	if err != nil {
+		jsonResponse(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+		return
+	}
+	rows := make([]db.SlackChannel, 0, len(channels))
+	for _, ch := range channels {
+		rows = append(rows, db.SlackChannel{
+			ChannelID:   ch.ID,
+			ChannelName: ch.Name,
+			IsPrivate:   ch.IsPrivate,
+		})
+	}
+	if err := a.store.UpsertChannels(r.Context(), workspace.ID, rows); err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	updated, _ := a.store.ListChannels(r.Context(), workspace.ID)
+	jsonResponse(w, http.StatusOK, map[string]any{"channels": updated})
+}
+
+func (a *App) handleUpdateChannels(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	var payload struct {
+		Channels []struct {
+			ChannelID string `json:"channel_id"`
+			Enabled   bool   `json:"enabled"`
+		} `json:"channels"`
+	}
+	if err := readJSON(r, &payload); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	updates := map[string]bool{}
+	for _, item := range payload.Channels {
+		updates[strings.TrimSpace(item.ChannelID)] = item.Enabled
+	}
+
+	subscription, err := a.store.GetWorkspaceSubscriptionOrDefault(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	plan := effectivePlan(subscription)
+	if limit := channelLimitForPlan(plan); limit != nil {
+		currentChannels, err := a.store.ListChannels(r.Context(), workspace.ID)
+		if err != nil {
+			jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		enabledCount := 0
+		for _, channel := range currentChannels {
+			enabled := channel.Enabled
+			if next, ok := updates[channel.ChannelID]; ok {
+				enabled = next
+			}
+			if enabled {
+				enabledCount++
+			}
+		}
+		if enabledCount > *limit {
+			planLabel := strings.ToUpper(plan)
+			jsonResponse(w, http.StatusPaymentRequired, map[string]any{
+				"error": fmt.Sprintf("%s plan supports up to %d enabled channels. Upgrade in Billing to enable more channels.", planLabel, *limit),
+			})
+			return
+		}
+	}
+
+	if err := a.store.UpdateChannelStates(r.Context(), workspace.ID, updates); err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	channels, _ := a.store.ListChannels(r.Context(), workspace.ID)
+	jsonResponse(w, http.StatusOK, map[string]any{"channels": channels})
+}
+
+func (a *App) handleGetChannelOverrides(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	overrides, err := a.store.ListChannelSLAOverrides(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	canEdit, err := a.workspaceHasEnterprise(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"overrides": overrides,
+		"can_edit":  canEdit,
+	})
+}
+
+func (a *App) handleUpdateChannelOverrides(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	hasEnterprise, err := a.workspaceHasEnterprise(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	if !hasEnterprise {
+		jsonResponse(w, http.StatusPaymentRequired, map[string]any{
+			"error": "Enterprise plan required for per-channel SLA overrides.",
+		})
+		return
+	}
+
+	var payload struct {
+		Overrides []struct {
+			ChannelID        string `json:"channel_id"`
+			AckSLAMinutes    int    `json:"ack_sla_minutes"`
+			AssignSLAMinutes int    `json:"assign_sla_minutes"`
+			StaleHours       int    `json:"stale_hours"`
+		} `json:"overrides"`
+	}
+	if err := readJSON(r, &payload); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+
+	channels, err := a.store.ListChannels(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	knownChannels := make(map[string]struct{}, len(channels))
+	for _, channel := range channels {
+		knownChannels[channel.ChannelID] = struct{}{}
+	}
+
+	seen := map[string]struct{}{}
+	overrides := make([]db.ChannelSLAOverride, 0, len(payload.Overrides))
+	for _, item := range payload.Overrides {
+		channelID := strings.TrimSpace(item.ChannelID)
+		if channelID == "" {
+			jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "channel_id is required"})
+			return
+		}
+		if _, ok := knownChannels[channelID]; !ok {
+			jsonResponse(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("unknown channel_id: %s", channelID)})
+			return
+		}
+		if _, exists := seen[channelID]; exists {
+			jsonResponse(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("duplicate override for channel_id: %s", channelID)})
+			return
+		}
+		seen[channelID] = struct{}{}
+		if item.AckSLAMinutes <= 0 || item.AssignSLAMinutes <= 0 || item.StaleHours <= 0 {
+			jsonResponse(w, http.StatusBadRequest, map[string]any{
+				"error": "ack_sla_minutes, assign_sla_minutes, stale_hours must be positive for each override",
+			})
+			return
+		}
+		overrides = append(overrides, db.ChannelSLAOverride{
+			WorkspaceID:      workspace.ID,
+			ChannelID:        channelID,
+			AckSLAMinutes:    item.AckSLAMinutes,
+			AssignSLAMinutes: item.AssignSLAMinutes,
+			StaleHours:       item.StaleHours,
+		})
+	}
+
+	if err := a.store.ReplaceChannelSLAOverrides(r.Context(), workspace.ID, overrides); err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	updated, err := a.store.ListChannelSLAOverrides(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"overrides": updated,
+		"can_edit":  true,
+	})
+}
+
+func (a *App) handleDisconnectSlack(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+
+	disconnected, err := a.store.DisconnectSlack(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"ok":           true,
+		"disconnected": disconnected,
+	})
+}
+
+func (a *App) handleDeleteWorkspace(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+
+	var payload struct {
+		Confirm string `json:"confirm"`
+	}
+	if err := readJSON(r, &payload); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+
+	if strings.TrimSpace(payload.Confirm) != "DELETE" {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "confirm must be DELETE"})
+		return
+	}
+
+	if err := a.store.DeleteWorkspace(r.Context(), workspace.ID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+			return
+		}
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	a.logger.Printf("workspace deleted workspace_id=%s", workspace.ID)
+
+	jsonResponse(w, http.StatusOK, map[string]any{"ok": true, "deleted": true})
+}
+
+func (a *App) handleGetPolicies(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	policy, err := a.store.GetPolicy(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusOK, policy)
+}
+
+func (a *App) handleUpdatePolicies(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	var payload struct {
+		AckSLAMinutes       int    `json:"ack_sla_minutes"`
+		AssignSLAMinutes    int    `json:"assign_sla_minutes"`
+		StaleHours          int    `json:"stale_hours"`
+		DailyDigestTime     string `json:"daily_digest_time"`
+		Timezone            string `json:"timezone"`
+		EscalationChannelID string `json:"escalation_channel_id"`
+		LinearTeamID        string `json:"linear_team_id"`
+	}
+	if err := readJSON(r, &payload); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if payload.AckSLAMinutes <= 0 {
+		payload.AckSLAMinutes = 15
+	}
+	if payload.AssignSLAMinutes <= 0 {
+		payload.AssignSLAMinutes = 30
+	}
+	if payload.StaleHours <= 0 {
+		payload.StaleHours = 24
+	}
+	if payload.DailyDigestTime == "" {
+		payload.DailyDigestTime = "09:00:00"
+	}
+	normalizedDigestTime, err := parseTimeOfDay(payload.DailyDigestTime)
+	if err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "invalid daily_digest_time, expected HH:MM or HH:MM:SS"})
+		return
+	}
+	payload.DailyDigestTime = normalizedDigestTime
+	if payload.Timezone == "" {
+		payload.Timezone = "UTC"
+	}
+	policy := db.Policy{
+		WorkspaceID:         workspace.ID,
+		AckSLAMinutes:       payload.AckSLAMinutes,
+		AssignSLAMinutes:    payload.AssignSLAMinutes,
+		StaleHours:          payload.StaleHours,
+		DailyDigestTime:     payload.DailyDigestTime,
+		Timezone:            payload.Timezone,
+		EscalationChannelID: optionalString(payload.EscalationChannelID),
+		LinearTeamID:        optionalString(payload.LinearTeamID),
+	}
+	if err := a.store.UpdatePolicy(r.Context(), policy); err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	updated, _ := a.store.GetPolicy(r.Context(), workspace.ID)
+	jsonResponse(w, http.StatusOK, updated)
+}
+
+func (a *App) handleGetLinear(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	policy, _ := a.store.GetPolicy(r.Context(), workspace.ID)
+	_, err = a.store.GetLinearInstallation(r.Context(), workspace.ID)
+	if err != nil && !errorsIsNoRows(err) {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+
+	installed := err == nil
+	connected := installed
+	requiresReconnect := false
+	connectionError := ""
+
+	if installed {
+		healthCtx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+		defer cancel()
+		healthErr := a.withLinearAccessToken(healthCtx, workspace.ID, func(token string) error {
+			_, _, err := a.linearClient.GetViewer(healthCtx, token)
+			return err
+		})
+		if healthErr != nil {
+			if linear.IsAuthError(healthErr) || strings.Contains(strings.ToLower(healthErr.Error()), "linear auth required") {
+				connected = false
+				requiresReconnect = true
+				connectionError = "Linear authorization expired or revoked. Reconnect Linear."
+			} else {
+				connectionError = "Linear health check failed. Please retry."
+				a.logger.Printf("linear health check failed workspace=%s: %v", workspace.ID, healthErr)
+			}
+		}
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"installed":          installed,
+		"connected":          connected,
+		"requires_reconnect": requiresReconnect,
+		"connection_error":   connectionError,
+		"linear_team":        policy.LinearTeamID,
+		"oauth_url":          strings.TrimSuffix(a.cfg.APIBaseURL, "/") + "/api/linear/install",
+	})
+}
+
+func (a *App) handleSetLinearDefaults(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	var payload struct {
+		LinearTeamID string `json:"linear_team_id"`
+	}
+	if err := readJSON(r, &payload); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	policy, err := a.store.GetPolicy(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	policy.LinearTeamID = optionalString(payload.LinearTeamID)
+	if err := a.store.UpdatePolicy(r.Context(), policy); err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (a *App) handleDisconnectLinear(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+
+	disconnected, err := a.store.DisconnectLinear(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"ok":           true,
+		"disconnected": disconnected,
+	})
+}
+
+func (a *App) handleListLinearTeams(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	if _, err := a.store.GetLinearInstallation(r.Context(), workspace.ID); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "linear is not connected"})
+		return
+	}
+	var teams []linear.Team
+	if err := a.withLinearAccessToken(r.Context(), workspace.ID, func(token string) error {
+		fetchedTeams, err := a.linearClient.ListTeams(r.Context(), token)
+		if err != nil {
+			return err
+		}
+		teams = fetchedTeams
+		return nil
+	}); err != nil {
+		if linear.IsAuthError(err) || strings.Contains(strings.ToLower(err.Error()), "linear auth required") {
+			jsonResponse(w, http.StatusConflict, map[string]any{"error": "linear authorization expired, reconnect Linear"})
+			return
+		}
+		jsonResponse(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"teams": teams})
+}
+
+func (a *App) handleRequestSummary(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+
+	windowDays := parseWindowDays(r.URL.Query().Get("days"))
+
+	summary, overdue, err := a.store.RequestsSummary(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+
+	timezone := "UTC"
+	if policy, policyErr := a.store.GetPolicy(r.Context(), workspace.ID); policyErr == nil && strings.TrimSpace(policy.Timezone) != "" {
+		if _, tzErr := time.LoadLocation(policy.Timezone); tzErr == nil {
+			timezone = policy.Timezone
+		}
+	}
+	analytics, err := a.store.RequestAnalytics(r.Context(), workspace.ID, windowDays, timezone)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"summary":   summary,
+		"overdue":   overdue,
+		"analytics": analytics,
+	})
+}
+
+func (a *App) handleListRequests(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	status := strings.TrimSpace(r.URL.Query().Get("status"))
+	limit := 50
+	if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
+		if parsed, err := strconv.Atoi(rawLimit); err == nil {
+			limit = parsed
+		}
+	}
+	requests, err := a.store.ListRequestsByStatus(r.Context(), workspace.ID, status, limit)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"requests": requests})
+}
+
+func (a *App) handleActivity(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	limit := 50
+	if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
+		if parsed, err := strconv.Atoi(rawLimit); err == nil {
+			limit = parsed
+		}
+	}
+	activity, err := a.store.ListActivity(r.Context(), workspace.ID, limit)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"activity": activity})
+}
+
+func (a *App) handleListDeadLetters(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	limit := 100
+	if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
+		if parsed, err := strconv.Atoi(rawLimit); err == nil {
+			limit = parsed
+		}
+	}
+	rows, err := a.store.ListDeadLetters(r.Context(), workspace.ID, limit)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"dead_letters": rows})
+}
+
+func (a *App) handleRequestsCSV(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	hasEnterprise, err := a.workspaceHasEnterprise(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	if !hasEnterprise {
+		jsonResponse(w, http.StatusPaymentRequired, map[string]any{
+			"error": "Enterprise plan required for CSV exports.",
+		})
+		return
+	}
+
+	windowDays := parseWindowDays(r.URL.Query().Get("days"))
+	rows, err := a.store.ListRequestReportRows(r.Context(), workspace.ID, windowDays)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	lookup := a.buildRequestReportLookup(r.Context(), workspace.ID, rows)
+
+	filename := fmt.Sprintf("triageguard-requests-%dd.csv", windowDays)
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+	w.Header().Set("Cache-Control", "no-store")
+
+	cw := csv.NewWriter(w)
+	_ = cw.Write([]string{
+		"request_id",
+		"channel",
+		"channel_id",
+		"thread_ts",
+		"thread_url",
+		"title",
+		"status",
+		"priority",
+		"owner",
+		"owner_slack_id",
+		"created_at",
+		"acked_at",
+		"assigned_at",
+		"resolved_at",
+		"due_at",
+		"ack_overdue_sent_at",
+		"assign_overdue_sent_at",
+		"stale_sent_at",
+		"linear_issue",
+		"linear_issue_url",
+	})
+	for _, item := range rows {
+		threadURL := ""
+		if item.ThreadURL != nil {
+			threadURL = *item.ThreadURL
+		}
+		title := ""
+		if item.Title != nil {
+			title = *item.Title
+		}
+		owner := lookup.ownerDisplay(item.OwnerSlackID)
+		ownerID := ""
+		if item.OwnerSlackID != nil {
+			ownerID = strings.TrimSpace(*item.OwnerSlackID)
+		}
+		linearLabel := linearIssueLabel(item.LinearIssueURL, item.LinearIssueID)
+		linearURL := ""
+		if item.LinearIssueURL != nil {
+			linearURL = *item.LinearIssueURL
+		}
+		_ = cw.Write([]string{
+			item.ID.String(),
+			lookup.channelDisplay(item.ChannelID),
+			item.ChannelID,
+			item.ThreadTS,
+			threadURL,
+			title,
+			item.Status,
+			item.Priority,
+			owner,
+			ownerID,
+			item.CreatedAt.UTC().Format(time.RFC3339),
+			csvTimeValue(item.AckedAt),
+			csvTimeValue(item.AssignedAt),
+			csvTimeValue(item.ResolvedAt),
+			csvTimeValue(item.DueAt),
+			csvTimeValue(item.AckOverdueSentAt),
+			csvTimeValue(item.AssignOverdueSentAt),
+			csvTimeValue(item.StaleSentAt),
+			linearLabel,
+			linearURL,
+		})
+	}
+	cw.Flush()
+	if err := cw.Error(); err != nil {
+		a.logger.Printf("requests csv write error workspace=%s: %v", workspace.ID, err)
+	}
+}
+
+func (a *App) handleAnalyticsCSV(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	hasEnterprise, err := a.workspaceHasEnterprise(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	if !hasEnterprise {
+		jsonResponse(w, http.StatusPaymentRequired, map[string]any{
+			"error": "Enterprise plan required for CSV exports.",
+		})
+		return
+	}
+
+	windowDays := parseWindowDays(r.URL.Query().Get("days"))
+	timezone := "UTC"
+	if policy, policyErr := a.store.GetPolicy(r.Context(), workspace.ID); policyErr == nil && strings.TrimSpace(policy.Timezone) != "" {
+		if _, tzErr := time.LoadLocation(policy.Timezone); tzErr == nil {
+			timezone = policy.Timezone
+		}
+	}
+	analytics, err := a.store.RequestAnalytics(r.Context(), workspace.ID, windowDays, timezone)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+
+	filename := fmt.Sprintf("triageguard-analytics-%dd.csv", windowDays)
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+	w.Header().Set("Cache-Control", "no-store")
+
+	cw := csv.NewWriter(w)
+	_ = cw.Write([]string{
+		"date",
+		"window_days",
+		"ack_avg_minutes",
+		"ack_sample_size",
+		"resolve_avg_minutes",
+		"resolve_sample_size",
+	})
+	for _, point := range analytics.Trend {
+		_ = cw.Write([]string{
+			point.Date,
+			strconv.Itoa(analytics.WindowDays),
+			csvFloatValue(point.AckAvgMinutes),
+			strconv.Itoa(point.AckSampleSize),
+			csvFloatValue(point.ResolveAvgMinutes),
+			strconv.Itoa(point.ResolveSampleSize),
+		})
+	}
+	cw.Flush()
+	if err := cw.Error(); err != nil {
+		a.logger.Printf("analytics csv write error workspace=%s: %v", workspace.ID, err)
+	}
+}
+
+func (a *App) handleLinearInstall(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		http.Error(w, "workspace not found", http.StatusNotFound)
+		return
+	}
+	userID, err := userIDFromContext(r.Context())
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	state, nonce, err := a.buildOAuthState("linear", &userID, &workspace.ID)
+	if err != nil {
+		http.Error(w, "failed to start linear oauth", http.StatusInternalServerError)
+		return
+	}
+	a.setOAuthStateCookie(w, "linear", nonce)
+
+	u, _ := url.Parse("https://linear.app/oauth/authorize")
+	q := u.Query()
+	q.Set("client_id", a.cfg.LinearClientID)
+	q.Set("redirect_uri", a.cfg.LinearRedirectURI)
+	q.Set("response_type", "code")
+	q.Set("scope", "read,write")
+	q.Set("state", state)
+	u.RawQuery = q.Encode()
+	http.Redirect(w, r, u.String(), http.StatusFound)
+}
+
+func (a *App) handleLinearOAuthCallback(w http.ResponseWriter, r *http.Request) {
+	defer a.clearOAuthStateCookie(w, "linear")
+	statePayload, err := a.validateOAuthState(r, "linear")
+	if err != nil {
+		a.logger.Printf("linear oauth callback: invalid state: %v", err)
+		http.Error(w, "invalid oauth state", http.StatusBadRequest)
+		return
+	}
+
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		http.Error(w, "missing code", http.StatusBadRequest)
+		return
+	}
+	if statePayload.WorkspaceID == "" {
+		http.Error(w, "missing workspace in oauth state", http.StatusBadRequest)
+		return
+	}
+	workspaceID, err := uuid.Parse(statePayload.WorkspaceID)
+	if err != nil {
+		http.Error(w, "invalid workspace in oauth state", http.StatusBadRequest)
+		return
+	}
+
+	token, err := a.linearClient.ExchangeOAuthCode(r.Context(), a.cfg.LinearClientID, a.cfg.LinearClientSecret, code, a.cfg.LinearRedirectURI)
+	if err != nil {
+		a.logger.Printf("linear oauth callback: exchange failed workspace=%s: %v", workspaceID, err)
+		http.Error(w, "linear oauth exchange failed", http.StatusBadGateway)
+		return
+	}
+	if err := a.store.UpsertLinearInstallation(
+		r.Context(),
+		workspaceID,
+		token.AccessToken,
+		optionalString(token.RefreshToken),
+		linearTokenExpiresAt(time.Now(), token.ExpiresIn),
+	); err != nil {
+		a.logger.Printf("linear oauth callback: save installation failed workspace=%s: %v", workspaceID, err)
+		http.Error(w, "failed to save linear installation", http.StatusInternalServerError)
+		return
+	}
+	if statePayload.UserID != "" {
+		userID, err := uuid.Parse(statePayload.UserID)
+		if err != nil {
+			http.Error(w, "invalid oauth state user", http.StatusBadRequest)
+			return
+		}
+		if err := a.store.EnsureWorkspaceMember(r.Context(), workspaceID, userID, "admin"); err != nil {
+			a.logger.Printf("linear oauth callback: ensure workspace member failed workspace=%s user=%s: %v", workspaceID, userID, err)
+			http.Error(w, "failed to bind workspace member", http.StatusInternalServerError)
+			return
+		}
+	}
+	http.Redirect(w, r, strings.TrimSuffix(a.cfg.WebBaseURL, "/")+"/linear?connected=1", http.StatusFound)
+}
+
+func (a *App) authContext(r *http.Request) context.Context {
+	return r.Context()
+}
+
+func encodeJSON(v any) []byte {
+	b, _ := json.Marshal(v)
+	return b
+}
+
+func parseTimeOfDay(raw string) (string, error) {
+	if raw == "" {
+		return "09:00:00", nil
+	}
+	if len(raw) == 5 {
+		raw += ":00"
+	}
+	if _, err := time.Parse("15:04:05", raw); err != nil {
+		return "", err
+	}
+	return raw, nil
+}

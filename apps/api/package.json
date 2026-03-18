@@ -1,0 +1,10 @@
+{
+  "name": "@triageguard/api",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "go run ./cmd/server",
+    "build": "mkdir -p bin && go build -o bin/server ./cmd/server",
+    "lint": "go test ./..."
+  }
+}

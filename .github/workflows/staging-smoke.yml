@@ -1,0 +1,25 @@
+name: Staging Smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  workflow_call:
+
+jobs:
+  smoke:
+    if: ${{ secrets.STAGING_WEB_BASE_URL != '' && secrets.STAGING_API_BASE_URL != '' && secrets.STAGING_TEST_EMAIL != '' && secrets.STAGING_TEST_PASSWORD != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run staging smoke checks
+        env:
+          STAGING_WEB_BASE_URL: ${{ secrets.STAGING_WEB_BASE_URL }}
+          STAGING_API_BASE_URL: ${{ secrets.STAGING_API_BASE_URL }}
+          STAGING_TEST_EMAIL: ${{ secrets.STAGING_TEST_EMAIL }}
+          STAGING_TEST_PASSWORD: ${{ secrets.STAGING_TEST_PASSWORD }}
+          STAGING_EXPECT_PAID: ${{ vars.STAGING_EXPECT_PAID }}
+        run: ./scripts/qa/staging-smoke.sh

@@ -1,0 +1,9 @@
+.env
+.env.*
+bin
+server
+.turbo
+node_modules
+coverage
+tmp
+*.log
