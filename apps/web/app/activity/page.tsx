@@ -11,7 +11,8 @@ type ActivityItem = {
   id: string;
   request_id: string;
   action_type: string;
-  actor_slack_id: string;
+  actor_type: string;
+  actor_id?: string;
   created_at: string;
   payload: Record<string, unknown>;
 };
@@ -36,14 +37,14 @@ export default function ActivityPage() {
           <Card className="border-border/60 shadow-sm">
             <CardHeader className="pb-3">
               <CardTitle className="text-base font-semibold">Recent activity</CardTitle>
-              <CardDescription className="text-xs">ACK / ASSIGN / PRIORITY / DUE / CONVERT / RESOLVE / REOPEN / IGNORE</CardDescription>
+              <CardDescription className="text-xs">Request event log across Slack users, schedulers, system flows and external providers.</CardDescription>
             </CardHeader>
             <CardContent className="p-0">
               <Table>
                 <TableHeader>
                   <TableRow className="border-border/40 hover:bg-transparent">
                     <TableHead className="pl-6 text-xs">When</TableHead>
-                    <TableHead className="text-xs">Action</TableHead>
+                    <TableHead className="text-xs">Event</TableHead>
                     <TableHead className="text-xs">Actor</TableHead>
                     <TableHead className="text-xs">Request</TableHead>
                     <TableHead className="pr-6 text-xs">Payload</TableHead>
@@ -56,7 +57,10 @@ export default function ActivityPage() {
                         {new Date(item.created_at).toLocaleString()}
                       </TableCell>
                       <TableCell className="text-xs font-semibold">{item.action_type}</TableCell>
-                      <TableCell className="text-xs text-muted-foreground">{item.actor_slack_id}</TableCell>
+                      <TableCell className="text-xs text-muted-foreground">
+                        {item.actor_type}
+                        {item.actor_id ? `: ${item.actor_id}` : ""}
+                      </TableCell>
                       <TableCell className="text-xs text-muted-foreground">{item.request_id}</TableCell>
                       <TableCell className="pr-6 text-xs text-muted-foreground">{JSON.stringify(item.payload)}</TableCell>
                     </TableRow>

@@ -18,7 +18,9 @@ export function ConsoleNav() {
       <Link href="/dashboard">Dashboard</Link>
       <Link href="/onboarding">Onboarding</Link>
       <Link href="/channels">Channels</Link>
+      <Link href="/queues">Queues</Link>
       <Link href="/policies">Policies</Link>
+      <Link href="/ops">Ops</Link>
       <Link href="/linear">Linear</Link>
       <Link href="/billing">Billing</Link>
       <Link href="/activity">Activity</Link>

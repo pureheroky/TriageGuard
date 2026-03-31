@@ -2,7 +2,9 @@ package handlers
 
 import (
 	"testing"
+	"time"
 
+	"triageguard/apps/api/internal/db"
 	"triageguard/apps/api/internal/linear"
 )
 
@@ -85,5 +87,55 @@ func TestSlackActionDedupKey(t *testing.T) {
 	}
 	if key1 != key2 {
 		t.Fatalf("dedup key must be stable for same payload")
+	}
+}
+
+func TestNextBusinessStartForPolicy(t *testing.T) {
+	start := "09:30:00"
+	tests := []struct {
+		name   string
+		policy db.QueuePolicy
+		now    time.Time
+		want   time.Time
+	}{
+		{
+			name: "business hours skip weekend and use queue start time",
+			policy: db.QueuePolicy{
+				Timezone:             "UTC",
+				BusinessHoursEnabled: true,
+				BusinessHoursStart:   &start,
+				BusinessDaysMask:     (1 << int(time.Monday)) | (1 << int(time.Tuesday)) | (1 << int(time.Wednesday)) | (1 << int(time.Thursday)) | (1 << int(time.Friday)),
+			},
+			now:  time.Date(2026, time.March, 27, 17, 0, 0, 0, time.UTC),
+			want: time.Date(2026, time.March, 30, 9, 30, 0, 0, time.UTC),
+		},
+		{
+			name: "disabled business hours defaults to next day 09:00 in queue timezone",
+			policy: db.QueuePolicy{
+				Timezone: "UTC",
+			},
+			now:  time.Date(2026, time.March, 31, 18, 15, 0, 0, time.UTC),
+			want: time.Date(2026, time.April, 1, 9, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "invalid timezone falls back to utc",
+			policy: db.QueuePolicy{
+				Timezone: "Invalid/Timezone",
+			},
+			now:  time.Date(2026, time.March, 31, 23, 0, 0, 0, time.UTC),
+			want: time.Date(2026, time.April, 1, 9, 0, 0, 0, time.UTC),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := nextBusinessStartForPolicy(tt.policy, tt.now)
+			if got == nil {
+				t.Fatalf("expected non-nil next business start")
+			}
+			if !got.Equal(tt.want) {
+				t.Fatalf("nextBusinessStartForPolicy() = %s want %s", got.UTC().Format(time.RFC3339), tt.want.UTC().Format(time.RFC3339))
+			}
+		})
 	}
 }

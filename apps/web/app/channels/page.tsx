@@ -9,6 +9,7 @@ import { RequireAuth } from "@/app/components/require-auth";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
@@ -19,6 +20,14 @@ type Channel = {
   channel_name: string;
   is_private?: boolean;
   enabled: boolean;
+  default_queue_id?: string | null;
+};
+
+type QueueOption = {
+  queue: {
+    id: string;
+    name: string;
+  };
 };
 
 type ChannelOverride = {
@@ -81,6 +90,11 @@ export default function ChannelsPage() {
     enabled: isEnterprise,
   });
 
+  const queuesQuery = useQuery({
+    queryKey: ["queues"],
+    queryFn: () => apiFetch<{ queues: QueueOption[] }>("/api/queues"),
+  });
+
   useEffect(() => {
     if (!isEnterprise) {
       if (localOverrides !== null) {
@@ -118,7 +132,11 @@ export default function ChannelsPage() {
       apiFetch("/api/channels", {
         method: "PUT",
         body: JSON.stringify({
-          channels: payload.map((channel) => ({ channel_id: channel.channel_id, enabled: channel.enabled })),
+          channels: payload.map((channel) => ({
+            channel_id: channel.channel_id,
+            enabled: channel.enabled,
+            default_queue_id: channel.default_queue_id ?? "",
+          })),
         }),
       }),
   });
@@ -253,6 +271,7 @@ export default function ChannelsPage() {
                     <TableHead className="text-xs">Channel</TableHead>
                     <TableHead className="text-xs">Visibility</TableHead>
                     <TableHead className="text-xs">ID</TableHead>
+                    <TableHead className="text-xs">Default queue</TableHead>
                     <TableHead className="text-xs">SLA override (Ack/Assign/Stale)</TableHead>
                   </TableRow>
                 </TableHeader>
@@ -295,6 +314,32 @@ export default function ChannelsPage() {
                         </TableCell>
                         <TableCell className="text-xs text-muted-foreground">{channel.channel_id}</TableCell>
                         <TableCell>
+                          <Select
+                            value={channel.default_queue_id || "__none__"}
+                            onValueChange={(value) =>
+                              setLocalChannels(
+                                channels.map((item) =>
+                                  item.channel_id === channel.channel_id
+                                    ? { ...item, default_queue_id: value === "__none__" ? null : value }
+                                    : item,
+                                ),
+                              )
+                            }
+                          >
+                            <SelectTrigger className="h-8 min-w-48 text-xs">
+                              <SelectValue placeholder="Select queue" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="__none__">No default queue</SelectItem>
+                              {(queuesQuery.data?.queues ?? []).map((item) => (
+                                <SelectItem key={item.queue.id} value={item.queue.id}>
+                                  {item.queue.name}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </TableCell>
+                        <TableCell>
                           {isEnterprise ? (
                             <div className="grid grid-cols-3 gap-2">
                               <Input
@@ -331,7 +376,7 @@ export default function ChannelsPage() {
                   })}
                   {filtered.length === 0 ? (
                     <TableRow>
-                      <TableCell colSpan={5} className="py-12 text-center">
+                      <TableCell colSpan={6} className="py-12 text-center">
                         <p className="text-sm text-muted-foreground">No channels found.</p>
                       </TableCell>
                     </TableRow>

@@ -12,6 +12,7 @@ import (
 type Config struct {
 	APIBaseURL                   string
 	WebBaseURL                   string
+	InternalOperatorUserIDs      []string
 	SentryDSN                    string
 	AlertWebhookURL              string
 	AlertFiveXXThreshold         int
@@ -60,6 +61,7 @@ func Load() (Config, error) {
 	cfg := Config{
 		APIBaseURL:                   envOr("API_BASE_URL", "http://localhost:8080"),
 		WebBaseURL:                   envOr("WEB_BASE_URL", "http://localhost:3000"),
+		InternalOperatorUserIDs:      envCSV("INTERNAL_OPERATOR_USER_IDS"),
 		SentryDSN:                    os.Getenv("SENTRY_DSN"),
 		AlertWebhookURL:              os.Getenv("ALERT_WEBHOOK_URL"),
 		AlertFiveXXThreshold:         envIntOr("ALERT_5XX_THRESHOLD", 20),
@@ -145,6 +147,22 @@ func Load() (Config, error) {
 		cfg.AlertDeadLetterWindowMinutes = 10
 	}
 	return cfg, nil
+}
+
+func envCSV(key string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 func envOr(key, fallback string) string {

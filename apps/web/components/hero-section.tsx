@@ -12,17 +12,17 @@ export function HeroSection() {
       <div className="relative mx-auto flex max-w-7xl flex-col items-center gap-16 px-6 py-24 lg:flex-row lg:gap-20 lg:py-32">
         <div className="flex max-w-2xl flex-col items-start gap-8 lg:flex-1">
           <Badge variant="secondary" className="rounded-full border border-primary/15 bg-primary/5 px-4 py-1.5 text-xs font-medium text-primary">
-            Slack-native triage for engineering teams
+            Queue control for internal Slack requests
           </Badge>
 
           <div className="flex flex-col gap-5">
             <h1 className="text-balance text-4xl font-bold leading-[1.1] tracking-tight text-foreground sm:text-5xl lg:text-[3.5rem]">
-              Stop losing requests
+              We do not create tickets.
               <br />
-              <span className="text-primary">in Slack.</span>
+              <span className="text-primary">We stop requests from getting lost.</span>
             </h1>
             <p className="max-w-lg text-pretty text-lg leading-relaxed text-muted-foreground">
-              Convert Slack messages into managed requests with ownership, SLA timers, escalations, and optional Linear bidirectional sync.
+              See unacked requests, unassigned work, SLA risk, waiting vs forgotten items, and overall queue health before the process slips.
             </p>
           </div>
 
@@ -48,7 +48,7 @@ export function HeroSection() {
               Public + private channels
             </Badge>
             <Badge variant="secondary" className="rounded-full border border-border/60 px-3 py-1 text-[11px]">
-              Slack + Linear (optional)
+              Queue health + tracker sync
             </Badge>
           </div>
         </div>

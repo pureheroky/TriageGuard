@@ -64,7 +64,7 @@ function PaywallPageContent() {
         <div className="mx-auto max-w-3xl space-y-6">
           <div>
             <h1 className="text-2xl font-bold tracking-tight text-foreground">Upgrade Required</h1>
-            <p className="mt-1 text-sm text-muted-foreground">Activate Team or Enterprise subscription to unlock Slack setup, triage, SLA, and Linear flows.</p>
+            <p className="mt-1 text-sm text-muted-foreground">Activate Team or Enterprise to unlock queue control, Slack triage, SLA health, digests, and tracker sync.</p>
           </div>
 
           <Card className="border-border/60 shadow-sm">

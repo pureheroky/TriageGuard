@@ -8,6 +8,7 @@ TriageGuard converts Slack messages from selected channels into managed Requests
 - `apps/web`: Next.js landing + admin console
 - `supabase/migrations`: SQL schema migrations
 - `turbo.json`: Turborepo task pipeline
+- `docs/product-logic.md`: detailed product logic, lifecycle, integrations, and functional behavior
 - `docs/security-checklist.md`: production security hardening checklist
 
 ## MVP scope implemented

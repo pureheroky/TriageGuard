@@ -60,11 +60,12 @@ type SlackInstallation struct {
 }
 
 type SlackChannel struct {
-	ChannelID   string    `json:"channel_id"`
-	ChannelName string    `json:"channel_name"`
-	IsPrivate   bool      `json:"is_private"`
-	Enabled     bool      `json:"enabled"`
-	CreatedAt   time.Time `json:"created_at"`
+	ChannelID      string     `json:"channel_id"`
+	ChannelName    string     `json:"channel_name"`
+	IsPrivate      bool       `json:"is_private"`
+	Enabled        bool       `json:"enabled"`
+	DefaultQueueID *uuid.UUID `json:"default_queue_id,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
 }
 
 type ChannelSLAOverride struct {
@@ -128,6 +129,20 @@ type Request struct {
 	StaleSentAt         *time.Time
 	CreatedAt           time.Time `json:"created_at"`
 	TriageMessageTS     *string   `json:"triage_message_ts"`
+
+	State               string     `json:"state"`
+	AcknowledgedAt      *time.Time `json:"acknowledged_at"`
+	AcknowledgedBy      *string    `json:"acknowledged_by"`
+	OwnerUserID         *string    `json:"owner_user_id"`
+	RequestType         string     `json:"request_type"`
+	QueueID             *uuid.UUID `json:"queue_id"`
+	WaitingOn           string     `json:"waiting_on"`
+	SnoozedUntil        *time.Time `json:"snoozed_until"`
+	ClosedAt            *time.Time `json:"closed_at"`
+	ClosedBy            *string    `json:"closed_by"`
+	ClosedReason        *string    `json:"closed_reason"`
+	LastHumanActivityAt time.Time  `json:"last_human_activity_at"`
+	LastStateChangeAt   time.Time  `json:"last_state_change_at"`
 }
 
 type LinearInstallation struct {
@@ -215,12 +230,13 @@ type RequestReportRow struct {
 }
 
 type ActivityRow struct {
-	ID           uuid.UUID       `json:"id"`
-	RequestID    uuid.UUID       `json:"request_id"`
-	ActionType   string          `json:"action_type"`
-	ActorSlackID string          `json:"actor_slack_id"`
-	Payload      json.RawMessage `json:"payload"`
-	CreatedAt    time.Time       `json:"created_at"`
+	ID         uuid.UUID       `json:"id"`
+	RequestID  uuid.UUID       `json:"request_id"`
+	ActionType string          `json:"action_type"`
+	ActorType  string          `json:"actor_type"`
+	ActorID    *string         `json:"actor_id,omitempty"`
+	Payload    json.RawMessage `json:"payload"`
+	CreatedAt  time.Time       `json:"created_at"`
 }
 
 type DeadLetter struct {
@@ -639,7 +655,7 @@ func (s *Store) DeleteWorkspace(ctx context.Context, workspaceID uuid.UUID) erro
 
 func (s *Store) ListChannels(ctx context.Context, workspaceID uuid.UUID) ([]SlackChannel, error) {
 	rows, err := s.pool.Query(ctx, `
-		select channel_id, channel_name, is_private, enabled, created_at
+		select channel_id, channel_name, is_private, enabled, default_queue_id, created_at
 		from slack_channels
 		where workspace_id = $1
 		order by channel_name asc
@@ -652,7 +668,7 @@ func (s *Store) ListChannels(ctx context.Context, workspaceID uuid.UUID) ([]Slac
 	out := make([]SlackChannel, 0)
 	for rows.Next() {
 		var ch SlackChannel
-		if err := rows.Scan(&ch.ChannelID, &ch.ChannelName, &ch.IsPrivate, &ch.Enabled, &ch.CreatedAt); err != nil {
+		if err := rows.Scan(&ch.ChannelID, &ch.ChannelName, &ch.IsPrivate, &ch.Enabled, &ch.DefaultQueueID, &ch.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, ch)
@@ -667,8 +683,8 @@ func (s *Store) UpsertChannels(ctx context.Context, workspaceID uuid.UUID, chann
 	batch := &pgx.Batch{}
 	for _, ch := range channels {
 		batch.Queue(`
-			insert into slack_channels (workspace_id, channel_id, channel_name, is_private, enabled)
-			values ($1, $2, $3, $4, coalesce((select enabled from slack_channels where workspace_id = $1 and channel_id = $2), false))
+			insert into slack_channels (workspace_id, channel_id, channel_name, is_private, enabled, default_queue_id)
+			values ($1, $2, $3, $4, coalesce((select enabled from slack_channels where workspace_id = $1 and channel_id = $2), false), (select default_queue_id from slack_channels where workspace_id = $1 and channel_id = $2))
 			on conflict (workspace_id, channel_id) do update
 			set channel_name = excluded.channel_name,
 				is_private = excluded.is_private
@@ -987,48 +1003,80 @@ func (s *Store) FindWorkspaceSubscriptionByStripeCustomerID(ctx context.Context,
 }
 
 func (s *Store) UpsertRequest(ctx context.Context, req Request) (Request, error) {
+	now := time.Now().UTC()
+	queue, requestType, priority, err := s.ResolveIntakeRouting(ctx, req.WorkspaceID, req.ChannelID, req.AuthorSlackID, req.BodyText)
+	if err != nil {
+		return Request{}, err
+	}
+
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return Request{}, err
+	}
+	defer tx.Rollback(ctx)
+
 	var out Request
-	err := s.pool.QueryRow(ctx, `
+	var inserted bool
+	row := tx.QueryRow(ctx, fmt.Sprintf(`
 		insert into requests (
 			workspace_id, source_key, channel_id, thread_ts, message_ts,
-			author_slack_id, body_text, title, status, priority, last_activity_at
+			author_slack_id, body_text, title, status, priority, last_activity_at,
+			state, acknowledged_at, acknowledged_by, owner_user_id, request_type, queue_id,
+			waiting_on, snoozed_until, closed_at, closed_by, closed_reason,
+			last_human_activity_at, last_state_change_at
 		)
-		values ($1, $2, $3, $4, $5, $6, $7, $8, 'NEW', 'P2', now())
+		values (
+			$1, $2, $3, $4, $5, $6, $7, $8, 'NEW', $9, $10,
+			'OPEN', null, null, null, $11, $12, 'none', null, null, null, null, $10, $10
+		)
 		on conflict (source_key)
 		do update set
 			body_text = excluded.body_text,
 			title = excluded.title,
 			message_ts = excluded.message_ts,
-			last_activity_at = now()
-		returning id, workspace_id, source_key, channel_id, thread_ts, message_ts,
-			author_slack_id, body_text, title, status, priority, owner_slack_id, due_at,
-			acked_at, assigned_at, resolved_at, last_activity_at,
-			ack_overdue_sent_at, assign_overdue_sent_at, stale_sent_at, created_at, triage_message_ts
-	`, req.WorkspaceID, req.SourceKey, req.ChannelID, req.ThreadTS, req.MessageTS, req.AuthorSlackID, req.BodyText, req.Title).Scan(
-		&out.ID,
-		&out.WorkspaceID,
-		&out.SourceKey,
-		&out.ChannelID,
-		&out.ThreadTS,
-		&out.MessageTS,
-		&out.AuthorSlackID,
-		&out.BodyText,
-		&out.Title,
-		&out.Status,
-		&out.Priority,
-		&out.OwnerSlackID,
-		&out.DueAt,
-		&out.AckedAt,
-		&out.AssignedAt,
-		&out.ResolvedAt,
-		&out.LastActivityAt,
-		&out.AckOverdueSentAt,
-		&out.AssignOverdueSentAt,
-		&out.StaleSentAt,
-		&out.CreatedAt,
-		&out.TriageMessageTS,
-	)
-	if err != nil {
+			last_activity_at = excluded.last_activity_at,
+			last_human_activity_at = excluded.last_human_activity_at,
+			priority = coalesce(requests.priority, excluded.priority),
+			request_type = coalesce(nullif(requests.request_type, ''), excluded.request_type),
+			queue_id = coalesce(requests.queue_id, excluded.queue_id)
+		returning %s, (xmax = 0) as inserted
+	`, requestSelectColumns("")), req.WorkspaceID, req.SourceKey, req.ChannelID, req.ThreadTS, req.MessageTS, req.AuthorSlackID, req.BodyText, req.Title, priority, now, requestType, queue.ID)
+	if err := scanRequestWithInserted(row, &out, &inserted); err != nil {
+		return Request{}, err
+	}
+
+	if inserted {
+		policy, err := getQueuePolicyForRequestTx(ctx, tx, out)
+		if err != nil {
+			return Request{}, err
+		}
+		if err := createClockPhaseTx(ctx, tx, out, policy, out.CreatedAt); err != nil {
+			return Request{}, err
+		}
+		eventPayload, _ := json.Marshal(map[string]any{
+			"channel_id":     out.ChannelID,
+			"thread_ts":      out.ThreadTS,
+			"queue_id":       out.QueueID,
+			"request_type":   out.RequestType,
+			"priority":       out.Priority,
+			"derived_status": DerivedStatus(out),
+		})
+		if _, err := insertRequestEventTx(ctx, tx, RequestEvent{
+			RequestID:  out.ID,
+			EventType:  "request_created",
+			ActorType:  "slack_user",
+			ActorID:    &out.AuthorSlackID,
+			OccurredAt: out.CreatedAt,
+			Payload:    eventPayload,
+		}); err != nil {
+			return Request{}, err
+		}
+		if err := enqueueRefreshTx(ctx, tx, out.ID); err != nil {
+			return Request{}, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
 		return Request{}, err
 	}
 	return out, nil
@@ -1036,37 +1084,11 @@ func (s *Store) UpsertRequest(ctx context.Context, req Request) (Request, error)
 
 func (s *Store) GetRequestByID(ctx context.Context, requestID uuid.UUID) (Request, error) {
 	var out Request
-	err := s.pool.QueryRow(ctx, `
-		select id, workspace_id, source_key, channel_id, thread_ts, message_ts,
-			author_slack_id, body_text, title, status, priority, owner_slack_id, due_at,
-			acked_at, assigned_at, resolved_at, last_activity_at,
-			ack_overdue_sent_at, assign_overdue_sent_at, stale_sent_at, created_at, triage_message_ts
+	err := scanRequest(s.pool.QueryRow(ctx, fmt.Sprintf(`
+		select %s
 		from requests
 		where id = $1
-	`, requestID).Scan(
-		&out.ID,
-		&out.WorkspaceID,
-		&out.SourceKey,
-		&out.ChannelID,
-		&out.ThreadTS,
-		&out.MessageTS,
-		&out.AuthorSlackID,
-		&out.BodyText,
-		&out.Title,
-		&out.Status,
-		&out.Priority,
-		&out.OwnerSlackID,
-		&out.DueAt,
-		&out.AckedAt,
-		&out.AssignedAt,
-		&out.ResolvedAt,
-		&out.LastActivityAt,
-		&out.AckOverdueSentAt,
-		&out.AssignOverdueSentAt,
-		&out.StaleSentAt,
-		&out.CreatedAt,
-		&out.TriageMessageTS,
-	)
+	`, requestSelectColumns("")), requestID), &out)
 	if err != nil {
 		return Request{}, err
 	}
@@ -1095,97 +1117,70 @@ func (s *Store) TouchRequestBySourceKey(ctx context.Context, sourceKey string) e
 }
 
 func (s *Store) SetAck(ctx context.Context, requestID uuid.UUID) error {
-	_, err := s.pool.Exec(ctx, `
-		update requests
-		set status = case when status = 'NEW' then 'ACKED' else status end,
-			acked_at = case when acked_at is null then now() else acked_at end,
-			last_activity_at = now(),
-			stale_sent_at = null
-		where id = $1
-	`, requestID)
+	ack := true
+	_, _, err := s.ApplyRequestMutation(ctx, RequestMutation{
+		RequestID:   requestID,
+		ActorType:   "system",
+		Acknowledge: &ack,
+	})
 	return err
 }
 
 func (s *Store) SetAssign(ctx context.Context, requestID uuid.UUID, ownerSlackID string) error {
-	_, err := s.pool.Exec(ctx, `
-		update requests
-		set owner_slack_id = $2,
-			assigned_at = now(),
-			status = case when status in ('NEW','ACKED') then 'ASSIGNED' else status end,
-			last_activity_at = now(),
-			stale_sent_at = null
-		where id = $1
-	`, requestID, ownerSlackID)
+	owner := strings.TrimSpace(ownerSlackID)
+	_, _, err := s.ApplyRequestMutation(ctx, RequestMutation{
+		RequestID:   requestID,
+		ActorType:   "system",
+		OwnerUserID: &owner,
+	})
 	return err
 }
 
 func (s *Store) SetPriority(ctx context.Context, requestID uuid.UUID, priority string) error {
-	_, err := s.pool.Exec(ctx, `
-		update requests
-		set priority = $2,
-			last_activity_at = now(),
-			stale_sent_at = null
-		where id = $1
-	`, requestID, priority)
+	priority = normalizedPriority(priority)
+	_, _, err := s.ApplyRequestMutation(ctx, RequestMutation{
+		RequestID: requestID,
+		ActorType: "system",
+		Priority:  &priority,
+	})
 	return err
 }
 
 func (s *Store) SetDue(ctx context.Context, requestID uuid.UUID, dueAt *time.Time) error {
-	_, err := s.pool.Exec(ctx, `
-		update requests
-		set due_at = $2,
-			last_activity_at = now(),
-			stale_sent_at = null
-		where id = $1
-	`, requestID, dueAt)
+	_, _, err := s.ApplyRequestMutation(ctx, RequestMutation{
+		RequestID: requestID,
+		ActorType: "system",
+		DueAt:     &dueAt,
+	})
 	return err
 }
 
 func (s *Store) SetIgnore(ctx context.Context, requestID uuid.UUID) error {
-	_, err := s.pool.Exec(ctx, `
-		update requests
-		set status = 'IGNORED',
-			last_activity_at = now(),
-			stale_sent_at = null
-		where id = $1
-	`, requestID)
+	reason := ClosedReasonNoise
+	_, _, err := s.ApplyRequestMutation(ctx, RequestMutation{
+		RequestID:   requestID,
+		ActorType:   "system",
+		CloseReason: &reason,
+	})
 	return err
 }
 
 func (s *Store) SetResolve(ctx context.Context, requestID uuid.UUID) error {
-	_, err := s.pool.Exec(ctx, `
-		update requests
-		set status = 'RESOLVED',
-			resolved_at = now(),
-			last_activity_at = now(),
-			stale_sent_at = null
-		where id = $1
-	`, requestID)
+	reason := ClosedReasonResolved
+	_, _, err := s.ApplyRequestMutation(ctx, RequestMutation{
+		RequestID:   requestID,
+		ActorType:   "system",
+		CloseReason: &reason,
+	})
 	return err
 }
 
 func (s *Store) SetReopen(ctx context.Context, requestID uuid.UUID) error {
-	_, err := s.pool.Exec(ctx, `
-		update requests
-		set status = case
-				when status in ('RESOLVED','IGNORED') and coalesce(owner_slack_id, '') <> '' then 'ASSIGNED'
-				when status in ('RESOLVED','IGNORED') then 'ACKED'
-				else status
-			end,
-			acked_at = case
-				when status in ('RESOLVED','IGNORED') and coalesce(owner_slack_id, '') = '' then coalesce(acked_at, now())
-				else acked_at
-			end,
-			resolved_at = case
-				when status = 'RESOLVED' then null
-				else resolved_at
-			end,
-			ack_overdue_sent_at = null,
-			assign_overdue_sent_at = null,
-			last_activity_at = now(),
-			stale_sent_at = null
-		where id = $1
-	`, requestID)
+	_, _, err := s.ApplyRequestMutation(ctx, RequestMutation{
+		RequestID: requestID,
+		ActorType: "system",
+		Reopen:    true,
+	})
 	return err
 }
 
@@ -1460,10 +1455,28 @@ func (s *Store) UpsertLinearIssue(ctx context.Context, issue LinearIssue) error 
 		on conflict (request_id)
 		do update set issue_id = excluded.issue_id, issue_url = excluded.issue_url
 	`, issue.RequestID, issue.IssueID, issue.IssueURL)
+	if err != nil {
+		return err
+	}
+	_, err = s.UpsertExternalIssue(ctx, ExternalIssue{
+		RequestID:   issue.RequestID,
+		Provider:    "linear",
+		ExternalID:  issue.IssueID,
+		ExternalKey: &issue.IssueID,
+		ExternalURL: &issue.IssueURL,
+		SyncState:   "linked",
+	})
 	return err
 }
 
 func (s *Store) GetLinearIssueByRequest(ctx context.Context, requestID uuid.UUID) (LinearIssue, error) {
+	if external, err := s.GetExternalIssueByProvider(ctx, requestID, "linear"); err == nil {
+		out := LinearIssue{RequestID: requestID, IssueID: external.ExternalID}
+		if external.ExternalURL != nil {
+			out.IssueURL = *external.ExternalURL
+		}
+		return out, nil
+	}
 	var out LinearIssue
 	err := s.pool.QueryRow(ctx, `
 		select request_id, issue_id, issue_url
@@ -1478,39 +1491,22 @@ func (s *Store) GetLinearIssueByRequest(ctx context.Context, requestID uuid.UUID
 
 func (s *Store) GetRequestByLinearIssueID(ctx context.Context, issueID string) (Request, error) {
 	var out Request
-	err := s.pool.QueryRow(ctx, `
-		select r.id, r.workspace_id, r.source_key, r.channel_id, r.thread_ts, r.message_ts,
-			r.author_slack_id, r.body_text, r.title, r.status, r.priority, r.owner_slack_id, r.due_at,
-			r.acked_at, r.assigned_at, r.resolved_at, r.last_activity_at,
-			r.ack_overdue_sent_at, r.assign_overdue_sent_at, r.stale_sent_at, r.created_at, r.triage_message_ts
+	err := scanRequest(s.pool.QueryRow(ctx, fmt.Sprintf(`
+		select %s
 		from requests r
-		join linear_issues li on li.request_id = r.id
-		where li.issue_id = $1
+		join external_issues ei on ei.request_id = r.id and ei.provider = 'linear'
+		where ei.external_id = $1
 		limit 1
-	`, strings.TrimSpace(issueID)).Scan(
-		&out.ID,
-		&out.WorkspaceID,
-		&out.SourceKey,
-		&out.ChannelID,
-		&out.ThreadTS,
-		&out.MessageTS,
-		&out.AuthorSlackID,
-		&out.BodyText,
-		&out.Title,
-		&out.Status,
-		&out.Priority,
-		&out.OwnerSlackID,
-		&out.DueAt,
-		&out.AckedAt,
-		&out.AssignedAt,
-		&out.ResolvedAt,
-		&out.LastActivityAt,
-		&out.AckOverdueSentAt,
-		&out.AssignOverdueSentAt,
-		&out.StaleSentAt,
-		&out.CreatedAt,
-		&out.TriageMessageTS,
-	)
+	`, requestSelectColumns("r")), strings.TrimSpace(issueID)), &out)
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = scanRequest(s.pool.QueryRow(ctx, fmt.Sprintf(`
+			select %s
+			from requests r
+			join linear_issues li on li.request_id = r.id
+			where li.issue_id = $1
+			limit 1
+		`, requestSelectColumns("r")), strings.TrimSpace(issueID)), &out)
+	}
 	if err != nil {
 		return Request{}, err
 	}
@@ -1518,31 +1514,11 @@ func (s *Store) GetRequestByLinearIssueID(ctx context.Context, issueID string) (
 }
 
 func (s *Store) UpdateOwnerFromExternal(ctx context.Context, requestID uuid.UUID, ownerSlackID *string) error {
-	var normalized *string
-	if ownerSlackID != nil {
-		candidate := strings.TrimSpace(*ownerSlackID)
-		if candidate != "" {
-			normalized = &candidate
-		}
-	}
-
-	_, err := s.pool.Exec(ctx, `
-		update requests
-		set owner_slack_id = $2,
-			status = case
-				when $2 is not null and status in ('NEW', 'ACKED') then 'ASSIGNED'
-				when $2 is null and status = 'ASSIGNED' then 'ACKED'
-				else status
-			end,
-			assigned_at = case
-				when $2 is not null then coalesce(assigned_at, now())
-				when $2 is null and status = 'ASSIGNED' then null
-				else assigned_at
-			end,
-			last_activity_at = now(),
-			stale_sent_at = null
-		where id = $1
-	`, requestID, normalized)
+	_, _, err := s.ApplyRequestMutation(ctx, RequestMutation{
+		RequestID:   requestID,
+		ActorType:   "external_provider",
+		OwnerUserID: ownerSlackID,
+	})
 	return err
 }
 
@@ -1814,18 +1790,20 @@ func (s *Store) ListRequestReportRows(ctx context.Context, workspaceID uuid.UUID
 }
 
 func (s *Store) ListRequestsByStatus(ctx context.Context, workspaceID uuid.UUID, status string, limit int) ([]Request, error) {
-	query := `
-		select id, workspace_id, source_key, channel_id, thread_ts, message_ts,
-			author_slack_id, body_text, title, status, priority, owner_slack_id, due_at,
-			acked_at, assigned_at, resolved_at, last_activity_at,
-			ack_overdue_sent_at, assign_overdue_sent_at, stale_sent_at, created_at, triage_message_ts
+	query := fmt.Sprintf(`
+		select %s
 		from requests
 		where workspace_id = $1
-	`
+	`, requestSelectColumns(""))
 	args := []any{workspaceID}
-	if status != "" {
-		query += " and status = $2"
-		args = append(args, status)
+	normalized := strings.ToUpper(strings.TrimSpace(status))
+	if normalized != "" {
+		if normalized == "OPEN" || normalized == "CLOSED" {
+			query += " and state = $2"
+		} else {
+			query += " and status = $2"
+		}
+		args = append(args, normalized)
 	}
 	query += " order by created_at desc"
 	if limit <= 0 || limit > 200 {
@@ -1848,30 +1826,7 @@ func (s *Store) ListRequestsByStatus(ctx context.Context, workspaceID uuid.UUID,
 	list := make([]Request, 0)
 	for rows.Next() {
 		var r Request
-		if err := rows.Scan(
-			&r.ID,
-			&r.WorkspaceID,
-			&r.SourceKey,
-			&r.ChannelID,
-			&r.ThreadTS,
-			&r.MessageTS,
-			&r.AuthorSlackID,
-			&r.BodyText,
-			&r.Title,
-			&r.Status,
-			&r.Priority,
-			&r.OwnerSlackID,
-			&r.DueAt,
-			&r.AckedAt,
-			&r.AssignedAt,
-			&r.ResolvedAt,
-			&r.LastActivityAt,
-			&r.AckOverdueSentAt,
-			&r.AssignOverdueSentAt,
-			&r.StaleSentAt,
-			&r.CreatedAt,
-			&r.TriageMessageTS,
-		); err != nil {
+		if err := scanRequest(rows, &r); err != nil {
 			return nil, err
 		}
 		list = append(list, r)
@@ -1884,11 +1839,11 @@ func (s *Store) ListActivity(ctx context.Context, workspaceID uuid.UUID, limit i
 		limit = 50
 	}
 	rows, err := s.pool.Query(ctx, `
-		select ra.id, ra.request_id, ra.action_type, ra.actor_slack_id, ra.payload, ra.created_at
-		from request_actions ra
-		join requests r on r.id = ra.request_id
+		select re.id, re.request_id, re.event_type, re.actor_type, re.actor_id, re.payload_json, re.occurred_at
+		from request_events re
+		join requests r on r.id = re.request_id
 		where r.workspace_id = $1
-		order by ra.created_at desc
+		order by re.occurred_at desc
 		limit $2
 	`, workspaceID, limit)
 	if err != nil {
@@ -1899,7 +1854,7 @@ func (s *Store) ListActivity(ctx context.Context, workspaceID uuid.UUID, limit i
 	out := make([]ActivityRow, 0)
 	for rows.Next() {
 		var a ActivityRow
-		if err := rows.Scan(&a.ID, &a.RequestID, &a.ActionType, &a.ActorSlackID, &a.Payload, &a.CreatedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.RequestID, &a.ActionType, &a.ActorType, &a.ActorID, &a.Payload, &a.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, a)

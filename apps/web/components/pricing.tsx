@@ -17,7 +17,7 @@ export function Pricing() {
           <p className="mb-3 text-sm font-semibold uppercase tracking-widest text-primary">Pricing</p>
           <h2 className="text-balance text-3xl font-bold tracking-tight text-foreground sm:text-4xl">Simple, transparent pricing</h2>
           <p className="mt-4 text-pretty text-base leading-relaxed text-muted-foreground">
-            Choose Team or Enterprise based on channel scale, custom SLA control, and reporting needs.
+            Start with bounded queue control on Team, then move to deeper analytics, custom policies, and rollout support on Enterprise.
           </p>
         </div>
 

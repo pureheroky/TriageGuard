@@ -26,7 +26,16 @@ type BillingState = {
   paypal_payer_email?: string | null;
   paypal_last_payment_at?: string | null;
   channel_limit?: number | null;
+  triager_limit?: number | null;
   channels_enabled: number;
+  entitlements?: {
+    channel_limit?: number | null;
+    triager_limit?: number | null;
+    shared_policy_mode?: boolean;
+    custom_escalations?: boolean;
+    advanced_analytics?: boolean;
+    exports?: boolean;
+  };
   portal_available: boolean;
   checkout: {
     team_available: boolean;
@@ -110,7 +119,7 @@ export default function BillingPage() {
         <div className="mx-auto max-w-6xl space-y-6">
           <div>
             <h1 className="text-2xl font-bold tracking-tight text-foreground">Billing</h1>
-            <p className="mt-1 text-sm text-muted-foreground">Manage subscription plan and payment details for your workspace.</p>
+            <p className="mt-1 text-sm text-muted-foreground">Manage subscription packaging, queue-control entitlements, and payment details for your workspace.</p>
           </div>
 
           <Card className="border-border/60 shadow-sm">
@@ -158,6 +167,7 @@ export default function BillingPage() {
               ) : (
                 <span className="text-xs text-muted-foreground">Channels: {billing?.channels_enabled ?? 0}/unlimited</span>
               )}
+              {billing?.triager_limit != null ? <span className="text-xs text-muted-foreground">Triagers: up to {billing.triager_limit}</span> : null}
               {billingProvider === "stripe" ? (
                 <div className="ml-auto">
                   <Button
@@ -262,6 +272,23 @@ export default function BillingPage() {
           </div>
 
           <p className="text-xs text-muted-foreground">VAT may apply at checkout based on your location.</p>
+
+          {billing?.entitlements ? (
+            <Card className="border-border/60 shadow-sm">
+              <CardHeader>
+                <CardTitle className="text-base font-semibold">Current plan entitlements</CardTitle>
+                <CardDescription className="text-xs">What this workspace can use right now.</CardDescription>
+              </CardHeader>
+              <CardContent className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                <p className="text-sm text-muted-foreground">Shared policy mode: {billing.entitlements.shared_policy_mode ? "Yes" : "No"}</p>
+                <p className="text-sm text-muted-foreground">Custom escalations: {billing.entitlements.custom_escalations ? "Yes" : "No"}</p>
+                <p className="text-sm text-muted-foreground">Advanced analytics: {billing.entitlements.advanced_analytics ? "Yes" : "No"}</p>
+                <p className="text-sm text-muted-foreground">Exports: {billing.entitlements.exports ? "Yes" : "No"}</p>
+                <p className="text-sm text-muted-foreground">Channel limit: {billing.entitlements.channel_limit ?? "Unlimited"}</p>
+                <p className="text-sm text-muted-foreground">Triager limit: {billing.entitlements.triager_limit ?? "Unlimited"}</p>
+              </CardContent>
+            </Card>
+          ) : null}
 
           {billingQuery.isSuccess && !billing?.enabled ? (
             <div className="space-y-1 text-sm text-muted-foreground">

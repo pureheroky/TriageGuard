@@ -6,54 +6,35 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"triageguard/apps/api/internal/db"
 )
 
-func RenderTriageBlocks(req db.Request, linearURL string, timezone string, ackSLAMinutes int, assignSLAMinutes int) []map[string]any {
-	status := req.Status
+func RenderTriageBlocks(req db.Request, queueLabel string, trackerText string, slaHint string) []map[string]any {
 	owner := "Unassigned"
-	if req.OwnerSlackID != nil && *req.OwnerSlackID != "" {
-		owner = "<@" + *req.OwnerSlackID + ">"
+	if req.OwnerUserID != nil && *req.OwnerUserID != "" {
+		owner = "<@" + *req.OwnerUserID + ">"
 	}
 	due := "—"
 	if req.DueAt != nil {
-		loc, err := time.LoadLocation(timezone)
-		if err != nil {
-			loc = time.UTC
-		}
-		due = req.DueAt.In(loc).Format("2006-01-02")
+		due = req.DueAt.UTC().Format("2006-01-02")
 	}
-	slaHint := renderSLAHint(req, ackSLAMinutes, assignSLAMinutes, time.Now().UTC())
-	linearText := ""
-	if linearURL != "" {
-		parts := strings.Split(strings.TrimPrefix(linearURL, "https://"), "/")
-		label := "Issue"
-		if len(parts) > 0 {
-			label = parts[len(parts)-1]
-		}
-		linearText = fmt.Sprintf("*Linear:* <%s|%s>", linearURL, label)
-	}
-	isIgnored := req.Status == "IGNORED"
-	isResolved := req.Status == "RESOLVED"
-	isClosed := isIgnored || isResolved
+	blocker := blockerLabel(req)
 
-	resolveButton := button("Resolve", "tg_resolve", req.ID.String(), "", isClosed)
-	if isResolved || isIgnored {
-		resolveButton = button("Reopen", "tg_reopen", req.ID.String(), "primary", false)
-	}
-	ignoreButton := button("Ignore", "tg_ignore", req.ID.String(), "danger", isClosed)
-	if !isClosed {
-		ignoreButton["confirm"] = irreversibleIgnoreConfirm()
+	isClosed := strings.EqualFold(req.State, db.RequestStateClosed)
+	resolveLabel := "Resolve"
+	resolveActionID := "tg_resolve"
+	if isClosed {
+		resolveLabel = "Reopen"
+		resolveActionID = "tg_reopen"
 	}
 
 	actions := []map[string]any{
-		button("Acknowledge", "tg_ack", req.ID.String(), "primary", isClosed),
-		button("Assign", "tg_assign", req.ID.String(), "", isClosed),
-		prioritySelect(req.ID.String(), req.Priority, isClosed),
-		button("Due date", "tg_due", req.ID.String(), "", isClosed),
-		resolveButton,
-		button("Convert to Linear", "tg_convert", req.ID.String(), "", isClosed),
-		ignoreButton,
+		button("Triage", "tg_triage", req.ID.String(), "primary", isClosed),
+		button("Ack", "tg_ack", req.ID.String(), "", isClosed),
+		button(resolveLabel, resolveActionID, req.ID.String(), "", false),
+		overflowMenu(req),
 	}
 
 	blocks := []map[string]any{
@@ -64,66 +45,240 @@ func RenderTriageBlocks(req db.Request, linearURL string, timezone string, ackSL
 		{
 			"type": "section",
 			"fields": []map[string]any{
-				{"type": "mrkdwn", "text": "*Status:* " + status},
-				{"type": "mrkdwn", "text": "*Priority:* " + req.Priority},
 				{"type": "mrkdwn", "text": "*Owner:* " + owner},
+				{"type": "mrkdwn", "text": "*SLA:* " + slaHint},
+				{"type": "mrkdwn", "text": "*Blocker:* " + blocker},
+				{"type": "mrkdwn", "text": "*Status:* " + db.DerivedStatus(req)},
+				{"type": "mrkdwn", "text": "*Queue:* " + queueLabel},
+				{"type": "mrkdwn", "text": "*Type:* " + req.RequestType},
+				{"type": "mrkdwn", "text": "*Priority:* " + req.Priority},
 				{"type": "mrkdwn", "text": "*Due:* " + due},
+				{"type": "mrkdwn", "text": "*State:* " + req.State},
 			},
-		},
-		{
-			"type":     "context",
-			"elements": []map[string]any{{"type": "mrkdwn", "text": slaHint}},
 		},
 		{
 			"type":     "actions",
 			"elements": actions,
 		},
 	}
-	if linearText != "" {
+	if !isClosed {
+		blocks = append(blocks, map[string]any{
+			"type": "actions",
+			"elements": []map[string]any{
+				button("Assign to me", "tg_assign_me", req.ID.String(), "", false),
+				button("Waiting on requester", "tg_waiting_requester", req.ID.String(), "", false),
+				button("Snooze till tomorrow", "tg_snooze_tomorrow", req.ID.String(), "", false),
+			},
+		})
+	}
+	if trackerText != "" {
 		blocks = append(blocks, map[string]any{
 			"type": "section",
-			"text": map[string]any{"type": "mrkdwn", "text": linearText},
+			"text": map[string]any{"type": "mrkdwn", "text": trackerText},
 		})
 	}
 	return blocks
 }
 
-func renderSLAHint(req db.Request, ackSLAMinutes int, assignSLAMinutes int, now time.Time) string {
-	status := strings.ToUpper(strings.TrimSpace(req.Status))
-	if status == "IGNORED" || status == "RESOLVED" {
-		return "SLA tracking paused"
-	}
-	if req.AckOverdueSentAt != nil {
-		return "⚠️ Ack overdue"
-	}
-	if req.AssignOverdueSentAt != nil {
-		return "⚠️ Assign overdue"
-	}
-	if ackSLAMinutes <= 0 {
-		ackSLAMinutes = 15
-	}
-	if assignSLAMinutes <= 0 {
-		assignSLAMinutes = 30
+func RenderTriageModal(req db.Request, queues []db.Queue) map[string]any {
+	requestID := req.ID.String()
+	blocks := []map[string]any{
+		checkboxInput("ack_block", "ack_checkbox", "Acknowledge", []map[string]any{
+			{"text": map[string]any{"type": "plain_text", "text": "Mark as acknowledged"}, "value": "ack"},
+		}, []string{"ack"}),
+		{
+			"type":     "input",
+			"block_id": "owner_block",
+			"optional": true,
+			"label":    map[string]any{"type": "plain_text", "text": "Owner"},
+			"element": map[string]any{
+				"type":        "users_select",
+				"action_id":   "owner_select",
+				"placeholder": map[string]any{"type": "plain_text", "text": "Select owner"},
+			},
+		},
+		staticSelectInput("priority_block", "priority_select", "Priority", []string{"P0", "P1", "P2"}, req.Priority, false),
+		staticSelectInput("type_block", "type_select", "Request type", []string{"bug", "incident", "access", "infra", "question", "task", "other"}, req.RequestType, false),
+		queueSelectInput("queue_block", "queue_select", queues, req.QueueID),
+		{
+			"type":     "input",
+			"block_id": "due_block",
+			"optional": true,
+			"label":    map[string]any{"type": "plain_text", "text": "Due date"},
+			"element": map[string]any{
+				"type":      "datepicker",
+				"action_id": "due_picker",
+			},
+		},
+		staticSelectInput("waiting_block", "waiting_select", "Waiting on", []string{"none", "requester", "other_team", "external_vendor", "scheduled_work"}, req.WaitingOn, true),
+		{
+			"type":     "input",
+			"block_id": "snooze_block",
+			"optional": true,
+			"label":    map[string]any{"type": "plain_text", "text": "Snooze until"},
+			"element": map[string]any{
+				"type":      "datepicker",
+				"action_id": "snooze_picker",
+			},
+		},
+		checkboxInput("tracker_block", "tracker_checkbox", "Tracker", []map[string]any{
+			{"text": map[string]any{"type": "plain_text", "text": "Link tracker issue"}, "value": "link_tracker"},
+		}, nil),
 	}
 
-	if status == "NEW" {
-		deadline := req.CreatedAt.Add(time.Duration(ackSLAMinutes) * time.Minute)
-		remaining := deadline.Sub(now)
-		if remaining <= 0 {
-			return "⚠️ Ack overdue"
-		}
-		return fmt.Sprintf("SLA: Ack due in %dm", ceilMinutes(remaining))
+	if req.OwnerUserID != nil && *req.OwnerUserID != "" {
+		blocks[1]["element"].(map[string]any)["initial_user"] = *req.OwnerUserID
 	}
-	if (status == "NEW" || status == "ACKED") && (req.OwnerSlackID == nil || strings.TrimSpace(*req.OwnerSlackID) == "") {
-		deadline := req.CreatedAt.Add(time.Duration(assignSLAMinutes) * time.Minute)
-		remaining := deadline.Sub(now)
-		if remaining <= 0 {
-			return "⚠️ Assign overdue"
-		}
-		return fmt.Sprintf("SLA: Assign due in %dm", ceilMinutes(remaining))
+	if req.DueAt != nil {
+		blocks[5]["element"].(map[string]any)["initial_date"] = req.DueAt.UTC().Format("2006-01-02")
+	}
+	if req.SnoozedUntil != nil {
+		blocks[7]["element"].(map[string]any)["initial_date"] = req.SnoozedUntil.UTC().Format("2006-01-02")
 	}
 
-	return "SLA tracking active"
+	return map[string]any{
+		"type":             "modal",
+		"callback_id":      "tg_triage_submit",
+		"private_metadata": requestID,
+		"title":            map[string]any{"type": "plain_text", "text": "Triage request"},
+		"submit":           map[string]any{"type": "plain_text", "text": "Save"},
+		"close":            map[string]any{"type": "plain_text", "text": "Cancel"},
+		"blocks":           blocks,
+	}
+}
+
+func blockerLabel(req db.Request) string {
+	if req.SnoozedUntil != nil && req.SnoozedUntil.After(time.Now().UTC()) {
+		return "Snoozed until " + req.SnoozedUntil.UTC().Format("2006-01-02 15:04 UTC")
+	}
+	if normalized := db.NormalizeWaitingOn(req.WaitingOn); normalized != db.WaitingOnNone {
+		return strings.Title(strings.ReplaceAll(normalized, "_", " "))
+	}
+	return "Active"
+}
+
+func RenderWaitingModal(req db.Request) map[string]any {
+	return map[string]any{
+		"type":             "modal",
+		"callback_id":      "tg_waiting_submit",
+		"private_metadata": req.ID.String(),
+		"title":            map[string]any{"type": "plain_text", "text": "Set waiting"},
+		"submit":           map[string]any{"type": "plain_text", "text": "Save"},
+		"close":            map[string]any{"type": "plain_text", "text": "Cancel"},
+		"blocks": []map[string]any{
+			staticSelectInput("waiting_block", "waiting_select", "Waiting on", []string{"requester", "other_team", "external_vendor", "scheduled_work"}, req.WaitingOn, false),
+			{
+				"type":     "input",
+				"block_id": "comment_block",
+				"optional": true,
+				"label":    map[string]any{"type": "plain_text", "text": "Comment"},
+				"element": map[string]any{
+					"type":      "plain_text_input",
+					"action_id": "comment_input",
+					"multiline": true,
+				},
+			},
+			{
+				"type":     "input",
+				"block_id": "review_block",
+				"optional": true,
+				"label":    map[string]any{"type": "plain_text", "text": "Review date"},
+				"element": map[string]any{
+					"type":      "datepicker",
+					"action_id": "review_picker",
+				},
+			},
+		},
+	}
+}
+
+func RenderSnoozeModal(req db.Request) map[string]any {
+	return map[string]any{
+		"type":             "modal",
+		"callback_id":      "tg_snooze_submit",
+		"private_metadata": req.ID.String(),
+		"title":            map[string]any{"type": "plain_text", "text": "Snooze request"},
+		"submit":           map[string]any{"type": "plain_text", "text": "Snooze"},
+		"close":            map[string]any{"type": "plain_text", "text": "Cancel"},
+		"blocks": []map[string]any{
+			staticSelectInput("preset_block", "preset_select", "Preset", []string{"4_hours", "tomorrow", "next_monday", "custom"}, "tomorrow", false),
+			{
+				"type":     "input",
+				"block_id": "custom_block",
+				"optional": true,
+				"label":    map[string]any{"type": "plain_text", "text": "Custom date"},
+				"element": map[string]any{
+					"type":      "datepicker",
+					"action_id": "custom_picker",
+				},
+			},
+		},
+	}
+}
+
+func RenderCloseModal(req db.Request) map[string]any {
+	return map[string]any{
+		"type":             "modal",
+		"callback_id":      "tg_close_submit",
+		"private_metadata": req.ID.String(),
+		"title":            map[string]any{"type": "plain_text", "text": "Close request"},
+		"submit":           map[string]any{"type": "plain_text", "text": "Close"},
+		"close":            map[string]any{"type": "plain_text", "text": "Cancel"},
+		"blocks": []map[string]any{
+			staticSelectInput("close_block", "close_select", "Close reason", []string{"resolved", "duplicate", "not_planned", "noise", "invalid"}, "resolved", false),
+		},
+	}
+}
+
+func RenderSLAHint(req db.Request, clocks []db.RequestSLAClock, now time.Time) string {
+	if strings.EqualFold(req.State, db.RequestStateClosed) {
+		return "SLA tracking stopped"
+	}
+	if len(clocks) == 0 {
+		return "SLA clocks pending"
+	}
+	parts := make([]string, 0, len(clocks))
+	for _, clock := range clocks {
+		label := strings.ToUpper(clock.ClockType)
+		switch clock.State {
+		case "satisfied":
+			parts = append(parts, fmt.Sprintf("%s satisfied", label))
+		case "paused":
+			parts = append(parts, fmt.Sprintf("%s paused", label))
+		case "breached":
+			parts = append(parts, fmt.Sprintf("⚠️ %s breached", label))
+		case "stopped":
+			parts = append(parts, fmt.Sprintf("%s stopped", label))
+		default:
+			if clock.TargetAt != nil {
+				remaining := clock.TargetAt.Sub(now)
+				if remaining <= 0 {
+					parts = append(parts, fmt.Sprintf("⚠️ %s due", label))
+				} else {
+					text := fmt.Sprintf("%s in %dm", label, ceilMinutes(remaining))
+					if clockIsAtRisk(clock, now) {
+						text = "At risk: " + text
+					}
+					parts = append(parts, text)
+				}
+			} else {
+				parts = append(parts, fmt.Sprintf("%s running", label))
+			}
+		}
+	}
+	return strings.Join(parts, " • ")
+}
+
+func clockIsAtRisk(clock db.RequestSLAClock, now time.Time) bool {
+	if clock.TargetAt == nil || clock.State != "running" {
+		return false
+	}
+	total := clock.TargetAt.Sub(clock.StartedAt)
+	if total <= 0 {
+		return false
+	}
+	elapsed := now.Sub(clock.StartedAt)
+	return elapsed >= time.Duration(float64(total)*0.8)
 }
 
 func ceilMinutes(d time.Duration) int {
@@ -134,41 +289,116 @@ func ceilMinutes(d time.Duration) int {
 	return minutes
 }
 
-func RenderAssignModal(requestID string) map[string]any {
+func queueSelectInput(blockID, actionID string, queues []db.Queue, currentQueueID *uuid.UUID) map[string]any {
+	options := make([]map[string]any, 0, len(queues))
+	var initial map[string]any
+	for _, queue := range queues {
+		option := map[string]any{
+			"text":  map[string]any{"type": "plain_text", "text": queue.Name},
+			"value": queue.ID.String(),
+		}
+		options = append(options, option)
+		if currentQueueID != nil && queue.ID == *currentQueueID {
+			initial = option
+		}
+	}
+	element := map[string]any{
+		"type":        "static_select",
+		"action_id":   actionID,
+		"placeholder": map[string]any{"type": "plain_text", "text": "Select queue"},
+		"options":     options,
+	}
+	if initial != nil {
+		element["initial_option"] = initial
+	}
 	return map[string]any{
-		"type":             "modal",
-		"callback_id":      "tg_assign_submit",
-		"private_metadata": requestID,
-		"title":            map[string]any{"type": "plain_text", "text": "Assign owner"},
-		"submit":           map[string]any{"type": "plain_text", "text": "Assign"},
-		"close":            map[string]any{"type": "plain_text", "text": "Cancel"},
-		"blocks": []map[string]any{
-			{
-				"type":     "input",
-				"block_id": "owner_block",
-				"label":    map[string]any{"type": "plain_text", "text": "Owner"},
-				"element":  map[string]any{"type": "users_select", "action_id": "owner_select"},
-			},
-		},
+		"type":     "input",
+		"block_id": blockID,
+		"label":    map[string]any{"type": "plain_text", "text": "Queue"},
+		"element":  element,
 	}
 }
 
-func RenderDueModal(requestID string) map[string]any {
+func staticSelectInput(blockID, actionID, label string, values []string, current string, optional bool) map[string]any {
+	options := make([]map[string]any, 0, len(values))
+	var initial map[string]any
+	for _, value := range values {
+		option := map[string]any{
+			"text":  map[string]any{"type": "plain_text", "text": renderOptionLabel(value)},
+			"value": value,
+		}
+		options = append(options, option)
+		if strings.EqualFold(strings.TrimSpace(current), strings.TrimSpace(value)) {
+			initial = option
+		}
+	}
+	element := map[string]any{
+		"type":        "static_select",
+		"action_id":   actionID,
+		"placeholder": map[string]any{"type": "plain_text", "text": label},
+		"options":     options,
+	}
+	if initial != nil {
+		element["initial_option"] = initial
+	}
 	return map[string]any{
-		"type":             "modal",
-		"callback_id":      "tg_due_submit",
-		"private_metadata": requestID,
-		"title":            map[string]any{"type": "plain_text", "text": "Set due date"},
-		"submit":           map[string]any{"type": "plain_text", "text": "Save"},
-		"close":            map[string]any{"type": "plain_text", "text": "Cancel"},
-		"blocks": []map[string]any{
-			{
-				"type":     "input",
-				"block_id": "due_block",
-				"label":    map[string]any{"type": "plain_text", "text": "Due date"},
-				"element":  map[string]any{"type": "datepicker", "action_id": "due_picker"},
-			},
-		},
+		"type":     "input",
+		"block_id": blockID,
+		"optional": optional,
+		"label":    map[string]any{"type": "plain_text", "text": label},
+		"element":  element,
+	}
+}
+
+func checkboxInput(blockID, actionID, label string, options []map[string]any, initial []string) map[string]any {
+	element := map[string]any{
+		"type":      "checkboxes",
+		"action_id": actionID,
+		"options":   options,
+	}
+	if len(initial) > 0 {
+		initialOptions := make([]map[string]any, 0, len(options))
+		for _, option := range options {
+			if value, _ := option["value"].(string); containsString(initial, value) {
+				initialOptions = append(initialOptions, option)
+			}
+		}
+		element["initial_options"] = initialOptions
+	}
+	return map[string]any{
+		"type":     "input",
+		"block_id": blockID,
+		"optional": true,
+		"label":    map[string]any{"type": "plain_text", "text": label},
+		"element":  element,
+	}
+}
+
+func overflowMenu(req db.Request) map[string]any {
+	options := []map[string]any{
+		overflowOption("Set waiting", "waiting|"+req.ID.String()),
+		overflowOption("Snooze", "snooze|"+req.ID.String()),
+		overflowOption("Reassign", "reassign|"+req.ID.String()),
+		overflowOption("Link tracker issue", "tracker|"+req.ID.String()),
+		overflowOption("Close request", "close|"+req.ID.String()),
+	}
+	if strings.EqualFold(req.State, db.RequestStateClosed) {
+		options = []map[string]any{
+			overflowOption("Reopen", "reopen|"+req.ID.String()),
+			overflowOption("Link tracker issue", "tracker|"+req.ID.String()),
+		}
+	}
+	return map[string]any{
+		"type":      "overflow",
+		"action_id": "tg_more",
+		"options":   options,
+	}
+}
+
+func overflowOption(text, value string) map[string]any {
+	return map[string]any{
+		"text":  map[string]any{"type": "plain_text", "text": text},
+		"value": value,
 	}
 }
 
@@ -193,36 +423,33 @@ func button(text, actionID, value, style string, disabled bool) map[string]any {
 	return m
 }
 
-func irreversibleIgnoreConfirm() map[string]any {
-	return map[string]any{
-		"title":   map[string]any{"type": "plain_text", "text": "Ignore request?"},
-		"text":    map[string]any{"type": "mrkdwn", "text": "This action is irreversible. The request will be marked as ignored and SLA reminders will stop."},
-		"confirm": map[string]any{"type": "plain_text", "text": "Ignore"},
-		"deny":    map[string]any{"type": "plain_text", "text": "Cancel"},
+func renderOptionLabel(value string) string {
+	switch strings.TrimSpace(value) {
+	case "other_team":
+		return "Other team"
+	case "external_vendor":
+		return "External vendor"
+	case "scheduled_work":
+		return "Scheduled work"
+	case "not_planned":
+		return "Not planned"
+	case "4_hours":
+		return "4 hours"
+	case "next_monday":
+		return "Next Monday"
+	default:
+		if strings.Contains(value, "_") {
+			return strings.Title(strings.ReplaceAll(value, "_", " "))
+		}
+		return strings.Title(value)
 	}
 }
 
-func prioritySelect(requestID, current string, disabled bool) map[string]any {
-	selectEl := map[string]any{
-		"type":        "static_select",
-		"action_id":   "tg_priority",
-		"placeholder": map[string]any{"type": "plain_text", "text": "Priority"},
-		"options": []map[string]any{
-			{"text": map[string]any{"type": "plain_text", "text": "P0"}, "value": "P0|" + requestID},
-			{"text": map[string]any{"type": "plain_text", "text": "P1"}, "value": "P1|" + requestID},
-			{"text": map[string]any{"type": "plain_text", "text": "P2"}, "value": "P2|" + requestID},
-		},
-	}
-	if current != "" {
-		selectEl["initial_option"] = map[string]any{"text": map[string]any{"type": "plain_text", "text": current}, "value": current + "|" + requestID}
-	}
-	if disabled {
-		selectEl["confirm"] = map[string]any{
-			"title":   map[string]any{"type": "plain_text", "text": "Closed"},
-			"text":    map[string]any{"type": "mrkdwn", "text": "Request already closed."},
-			"confirm": map[string]any{"type": "plain_text", "text": "OK"},
-			"deny":    map[string]any{"type": "plain_text", "text": "Cancel"},
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
 		}
 	}
-	return selectEl
+	return false
 }

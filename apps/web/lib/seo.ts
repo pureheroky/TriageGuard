@@ -1,6 +1,6 @@
 export const siteName = "TriageGuard";
 export const siteDescription =
-  "Turn Slack messages into trackable requests with ownership, priority, due dates, and SLA timers.";
+  "Keep internal requests from getting lost with queue health, unacked and unassigned visibility, SLA risk, and waiting vs forgotten control.";
 
 export function getSiteUrl(): string {
   const envUrl = process.env.NEXT_PUBLIC_SITE_URL?.trim();

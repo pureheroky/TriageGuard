@@ -97,6 +97,46 @@ func TestBillingPlanHelpers(t *testing.T) {
 	if limit := channelLimitForPlan(planEnterprise); limit != nil {
 		t.Fatalf("enterprise channel limit must be unlimited")
 	}
+	if limit := triagerLimitForPlan(planTeam); limit == nil || *limit != 3 {
+		t.Fatalf("team triager limit must be 3")
+	}
+	if limit := triagerLimitForPlan(planEnterprise); limit != nil {
+		t.Fatalf("enterprise triager limit must be unlimited")
+	}
+
+	teamEntitlements := entitlementsForPlan(planTeam)
+	if teamEntitlements.ChannelLimit == nil || *teamEntitlements.ChannelLimit != 10 {
+		t.Fatalf("team channel limit entitlement must be 10")
+	}
+	if teamEntitlements.TriagerLimit == nil || *teamEntitlements.TriagerLimit != 3 {
+		t.Fatalf("team triager limit entitlement must be 3")
+	}
+	if !teamEntitlements.SharedPolicyMode {
+		t.Fatalf("team must use shared policy mode")
+	}
+	if teamEntitlements.CustomEscalations {
+		t.Fatalf("team must not allow custom escalations")
+	}
+	if teamEntitlements.AdvancedAnalytics {
+		t.Fatalf("team must not allow advanced analytics")
+	}
+	if teamEntitlements.Exports {
+		t.Fatalf("team must not allow exports")
+	}
+
+	enterpriseEntitlements := entitlementsForPlan(planEnterprise)
+	if enterpriseEntitlements.ChannelLimit != nil {
+		t.Fatalf("enterprise channel limit entitlement must be unlimited")
+	}
+	if enterpriseEntitlements.TriagerLimit != nil {
+		t.Fatalf("enterprise triager limit entitlement must be unlimited")
+	}
+	if enterpriseEntitlements.SharedPolicyMode {
+		t.Fatalf("enterprise must not be in shared policy mode")
+	}
+	if !enterpriseEntitlements.CustomEscalations || !enterpriseEntitlements.AdvancedAnalytics || !enterpriseEntitlements.Exports || !enterpriseEntitlements.MultipleQueueRules {
+		t.Fatalf("enterprise must unlock advanced entitlements")
+	}
 }
 
 func TestBillingProviderHelpers(t *testing.T) {

@@ -81,6 +81,29 @@ func channelLimitForPlan(plan string) *int {
 	return nil
 }
 
+func triagerLimitForPlan(plan string) *int {
+	normalized := normalizePlanKey(plan)
+	if normalized == planTeam {
+		limit := 3
+		return &limit
+	}
+	return nil
+}
+
+func entitlementsForPlan(plan string) db.WorkspaceEntitlements {
+	normalized := normalizePlanKey(plan)
+	entitlements := db.WorkspaceEntitlements{
+		ChannelLimit:       channelLimitForPlan(normalized),
+		TriagerLimit:       triagerLimitForPlan(normalized),
+		SharedPolicyMode:   normalized != planEnterprise,
+		CustomEscalations:  normalized == planEnterprise,
+		AdvancedAnalytics:  normalized == planEnterprise,
+		Exports:            normalized == planEnterprise,
+		MultipleQueueRules: normalized == planEnterprise,
+	}
+	return entitlements
+}
+
 type billingClientReference struct {
 	WorkspaceID uuid.UUID
 	PlanKey     string
@@ -220,7 +243,9 @@ func (a *App) handleGetBilling(w http.ResponseWriter, r *http.Request) {
 		"cancel_at_period_end":   sub.CancelAtPeriodEnd,
 		"current_period_end":     sub.CurrentPeriodEnd,
 		"channel_limit":          limit,
+		"triager_limit":          triagerLimitForPlan(effPlan),
 		"channels_enabled":       enabledCount,
+		"entitlements":           entitlementsForPlan(effPlan),
 		"paypal_payer_email":     sub.PayPalPayerEmail,
 		"paypal_last_payment_at": sub.PayPalLastPaymentAt,
 		"portal_available":       provider == billingStripe && sub.StripeCustomerID != nil && strings.TrimSpace(*sub.StripeCustomerID) != "",

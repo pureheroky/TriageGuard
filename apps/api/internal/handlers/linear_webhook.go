@@ -317,8 +317,8 @@ func verifyLinearWebhookSignature(body []byte, headerValue, webhookSecret string
 		if normalized == "" {
 			continue
 		}
-		if strings.HasPrefix(normalized, "sha256=") {
-			normalized = strings.TrimPrefix(normalized, "sha256=")
+		if after, ok := strings.CutPrefix(normalized, "sha256="); ok  {
+			normalized = after
 		}
 		if hmac.Equal([]byte(normalized), []byte(strings.ToLower(expectedHex))) {
 			return nil

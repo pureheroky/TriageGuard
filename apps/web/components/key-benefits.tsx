@@ -3,33 +3,33 @@ import { UserCheck, Timer, MailCheck, Ban, Route, ArrowRightLeft } from "lucide-
 const benefits = [
   {
     icon: UserCheck,
-    title: "Owner in one click",
-    description: "Assign responsibility directly in the Slack thread with audit logging.",
+    title: "Unacked and unassigned visibility",
+    description: "See which internal requests were seen, who owns them, and where the queue is already drifting.",
   },
   {
     icon: Timer,
-    title: "SLA timers & escalations",
-    description: "Ack/Assign SLA reminders plus stale pings and escalation channel notifications.",
+    title: "SLA risk before breach",
+    description: "Highlight at-risk work before it breaches and escalate only when a request is actually slipping.",
   },
   {
     icon: MailCheck,
-    title: "Daily digest",
-    description: "Daily summary includes overdue ack, unassigned requests, active P0, and top threads.",
+    title: "Queue health digests",
+    description: "Daily queue digests and weekly manager summaries show what worsened and what needs attention this week.",
   },
   {
     icon: Ban,
-    title: "Noise control",
-    description: "Mark non-actionable messages as ignored so only real requests stay visible.",
+    title: "Waiting vs forgotten",
+    description: "Separate healthy waiting work from truly forgotten requests with waiting states and snooze windows.",
   },
   {
     icon: Route,
-    title: "Thread-native triage",
-    description: "Acknowledge, assign, prioritize, set due dates, resolve, and reopen without leaving Slack.",
+    title: "Thread-native queue control",
+    description: "Triage, ownership, waiting, snooze, resolve, and reopen all happen inside the Slack conversation.",
   },
   {
     icon: ArrowRightLeft,
-    title: "Linear sync",
-    description: "Create a Linear issue with Slack context, then keep linked status, assignee, and due date in sync.",
+    title: "Tracker stays optional",
+    description: "Linear linking is available, but queue health, ownership, SLA state, and escalation stay owned by TriageGuard.",
   },
 ];
 
@@ -40,10 +40,10 @@ export function KeyBenefits() {
         <div className="mx-auto mb-16 max-w-2xl text-center">
           <p className="mb-3 text-sm font-semibold uppercase tracking-widest text-primary">Features</p>
           <h2 className="text-balance text-3xl font-bold tracking-tight text-foreground sm:text-4xl">
-            Everything you need to triage at scale
+            Built to keep internal requests under control
           </h2>
           <p className="mt-4 text-pretty text-base leading-relaxed text-muted-foreground">
-            Built for teams that live in Slack and need structure without leaving the conversation.
+            Not another intake form. A queue-control layer for teams that already live in Slack.
           </p>
         </div>
 

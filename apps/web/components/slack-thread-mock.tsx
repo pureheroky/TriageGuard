@@ -1,5 +1,5 @@
 import { Badge } from "@/components/ui/badge";
-import { User, Clock, AlertTriangle, CheckCircle2, ArrowRight, Ban } from "lucide-react";
+import { User, Clock, AlertTriangle, CheckCircle2, PauseCircle } from "lucide-react";
 
 export function SlackThreadMock() {
   return (
@@ -27,7 +27,7 @@ export function SlackThreadMock() {
               <span className="text-[11px] text-muted-foreground">11:32 AM</span>
             </div>
             <p className="text-sm leading-relaxed text-foreground/85">
-              Can someone help with the billing API? Customer Acme Corp is seeing duplicate charges on their invoice.
+              Can someone help with the billing API? Customer Acme Corp is seeing duplicate charges on their invoice and nobody has acked the request yet.
             </p>
           </div>
         </div>
@@ -47,10 +47,13 @@ export function SlackThreadMock() {
 
           <div className="mb-4 flex flex-wrap items-center gap-2">
             <Badge className="rounded-md bg-primary/10 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-primary hover:bg-primary/10">
-              New
+              Unacked
             </Badge>
             <Badge className="rounded-md bg-destructive/10 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-destructive hover:bg-destructive/10">
               P1
+            </Badge>
+            <Badge className="rounded-md bg-amber-100 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-amber-900 hover:bg-amber-100">
+              At risk
             </Badge>
             <div className="h-3.5 w-px bg-border" />
             <span className="flex items-center gap-1 text-xs text-muted-foreground">
@@ -60,18 +63,23 @@ export function SlackThreadMock() {
             <div className="h-3.5 w-px bg-border" />
             <span className="flex items-center gap-1 text-xs text-muted-foreground">
               <Clock className="size-3" />
-              Due: —
+              SLA: Ack overdue
             </span>
+          </div>
+
+          <div className="mb-3 flex items-center gap-2 rounded-lg bg-muted/40 px-3 py-2">
+            <PauseCircle className="size-3.5 text-muted-foreground" />
+            <span className="text-[11px] font-medium text-muted-foreground">Blocker: none yet. Waiting state and snooze stay visible on the card.</span>
           </div>
 
           <div className="flex flex-wrap gap-1.5">
             {[
-              { label: "Acknowledge", icon: CheckCircle2 },
-              { label: "Assign", icon: User },
-              { label: "Priority", icon: AlertTriangle },
-              { label: "Due date", icon: Clock },
-              { label: "Convert to Linear", icon: ArrowRight },
-              { label: "Ignore", icon: Ban },
+              { label: "Triage", icon: CheckCircle2 },
+              { label: "Ack", icon: CheckCircle2 },
+              { label: "Resolve", icon: AlertTriangle },
+              { label: "Assign to me", icon: User },
+              { label: "Waiting on requester", icon: PauseCircle },
+              { label: "More", icon: Clock },
             ].map(({ label, icon: Icon }) => (
               <button
                 key={label}
@@ -87,7 +95,7 @@ export function SlackThreadMock() {
         <div className="mt-3 flex items-center gap-2">
           <div className="flex items-center gap-2 rounded-lg bg-warning/10 px-3.5 py-1.5">
             <AlertTriangle className="size-3.5 text-warning-foreground" />
-            <span className="text-[11px] font-semibold text-warning-foreground">Overdue by 2h 15m</span>
+            <span className="text-[11px] font-semibold text-warning-foreground">Queue health risk: unacked + unassigned for 2h 15m</span>
           </div>
         </div>
       </div>

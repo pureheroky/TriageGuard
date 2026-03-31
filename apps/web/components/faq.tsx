@@ -16,7 +16,7 @@ const faqs = [
   {
     question: "How long does setup usually take?",
     answer:
-      "Most teams finish in 10-20 minutes: activate a plan, connect Slack, sync channels, choose monitored channels, set SLA thresholds, choose escalation channel, and optionally connect Linear.",
+      "Most teams reach first value in about 10 minutes: connect Slack, choose channels, create the first queue, assign triagers and managers, enable an SLA preset, then review open, unacked, unassigned, and at-risk work.",
   },
   {
     question: "Do you support private Slack channels?",
@@ -31,7 +31,7 @@ const faqs = [
   {
     question: "What exactly happens when SLA is missed?",
     answer:
-      "TriageGuard posts overdue alerts in the thread and in your escalation channel. It also includes overdue and unassigned items in daily digest.",
+      "TriageGuard shows at-risk work before breach, then posts breach and escalation notifications based on queue policy. Waiting and snoozed requests are treated differently from forgotten work to avoid false noise.",
   },
   {
     question: "How does VAT work?",
@@ -41,7 +41,7 @@ const faqs = [
   {
     question: "What data is stored?",
     answer:
-      "We store only operational metadata needed for triage: message text, status, priority, owner, due date, and action history. OAuth tokens are stored server-side and never exposed to browser code.",
+      "We store the operational metadata needed to control queue health: message text, ownership, queue, request type, due date, waiting or snooze state, SLA clock history, and action history. OAuth tokens are stored server-side and never exposed to browser code.",
   },
   {
     question: "Do you send our data to AI models?",

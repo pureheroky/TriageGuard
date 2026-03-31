@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
@@ -59,6 +60,7 @@ func (a *App) handleGetMe(w http.ResponseWriter, r *http.Request) {
 	_, slackErr := a.store.GetSlackInstallationByWorkspace(r.Context(), workspace.ID)
 	_, linearErr := a.store.GetLinearInstallation(r.Context(), workspace.ID)
 	subscription, _ := a.store.GetWorkspaceSubscriptionOrDefault(r.Context(), workspace.ID)
+	userID, _ := userIDFromContext(r.Context())
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"workspace": workspace,
 		"integrations": map[string]any{
@@ -73,7 +75,9 @@ func (a *App) handleGetMe(w http.ResponseWriter, r *http.Request) {
 			"effective_plan":       effectivePlan(subscription),
 			"cancel_at_period_end": subscription.CancelAtPeriodEnd,
 			"current_period_end":   subscription.CurrentPeriodEnd,
+			"entitlements":         entitlementsForPlan(effectivePlan(subscription)),
 		},
+		"internal_operator": a.isInternalOperatorUser(userID),
 	})
 }
 
@@ -89,6 +93,441 @@ func (a *App) handleListChannels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{"channels": channels})
+}
+
+func (a *App) handleListQueues(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	queues, err := a.store.ListQueues(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	policies, err := a.store.ListQueuePolicies(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	policyByQueue := map[string]db.QueuePolicy{}
+	for _, policy := range policies {
+		policyByQueue[policy.QueueID.String()] = policy
+	}
+	items := make([]map[string]any, 0, len(queues))
+	for _, queue := range queues {
+		members, _ := a.store.ListQueueMembers(r.Context(), queue.ID)
+		items = append(items, map[string]any{
+			"queue":   queue,
+			"policy":  policyByQueue[queue.ID.String()],
+			"members": members,
+		})
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"queues": items})
+}
+
+func (a *App) handleListQueueRoutingRules(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	rules, err := a.store.ListQueueRoutingRules(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"rules": rules})
+}
+
+func (a *App) handleUpsertQueueRoutingRules(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	var payload struct {
+		Rules []struct {
+			ID             string          `json:"id"`
+			Name           string          `json:"name"`
+			SortOrder      int             `json:"sort_order"`
+			IsEnabled      bool            `json:"is_enabled"`
+			ConditionsJSON json.RawMessage `json:"conditions_json"`
+			QueueID        string          `json:"queue_id"`
+			RequestType    *string         `json:"request_type"`
+			Priority       *string         `json:"priority"`
+			StopProcessing bool            `json:"stop_processing"`
+		} `json:"rules"`
+	}
+	if err := readJSON(r, &payload); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	rules := make([]db.QueueRoutingRule, 0, len(payload.Rules))
+	for _, item := range payload.Rules {
+		queueID, err := uuid.Parse(strings.TrimSpace(item.QueueID))
+		if err != nil {
+			jsonResponse(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("invalid queue_id for rule %s", item.Name)})
+			return
+		}
+		var ruleID uuid.UUID
+		if strings.TrimSpace(item.ID) != "" {
+			ruleID, err = uuid.Parse(strings.TrimSpace(item.ID))
+			if err != nil {
+				jsonResponse(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("invalid rule id: %s", item.ID)})
+				return
+			}
+		}
+		rules = append(rules, db.QueueRoutingRule{
+			ID:             ruleID,
+			WorkspaceID:    workspace.ID,
+			Name:           item.Name,
+			SortOrder:      item.SortOrder,
+			IsEnabled:      item.IsEnabled,
+			ConditionsJSON: item.ConditionsJSON,
+			QueueID:        queueID,
+			RequestType:    item.RequestType,
+			Priority:       item.Priority,
+			StopProcessing: item.StopProcessing,
+		})
+	}
+	if err := a.store.ReplaceQueueRoutingRules(r.Context(), workspace.ID, rules); err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	a.handleListQueueRoutingRules(w, r)
+}
+
+func (a *App) handleListEscalationSteps(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	queueID, err := uuid.Parse(strings.TrimSpace(r.URL.Query().Get("queue_id")))
+	if err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "invalid queue_id"})
+		return
+	}
+	queue, err := a.store.GetQueueByID(r.Context(), queueID)
+	if err != nil || queue.WorkspaceID != workspace.ID {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "queue not found"})
+		return
+	}
+	steps, err := a.store.ListEscalationStepsByQueue(r.Context(), queueID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"steps": steps})
+}
+
+func (a *App) handleUpsertEscalationSteps(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	hasEnterprise, err := a.workspaceHasEnterprise(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	if !hasEnterprise {
+		jsonResponse(w, http.StatusPaymentRequired, map[string]any{"error": "Enterprise plan required for custom escalation steps."})
+		return
+	}
+	var payload struct {
+		QueueID string `json:"queue_id"`
+		Steps   []struct {
+			ID                      string  `json:"id"`
+			ClockType               string  `json:"clock_type"`
+			DelayMinutesAfterBreach int     `json:"delay_minutes_after_breach"`
+			TargetType              string  `json:"target_type"`
+			TargetValue             *string `json:"target_value"`
+			MessageTemplate         *string `json:"message_template"`
+			IsEnabled               bool    `json:"is_enabled"`
+		} `json:"steps"`
+	}
+	if err := readJSON(r, &payload); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	queueID, err := uuid.Parse(strings.TrimSpace(payload.QueueID))
+	if err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "invalid queue_id"})
+		return
+	}
+	queue, err := a.store.GetQueueByID(r.Context(), queueID)
+	if err != nil || queue.WorkspaceID != workspace.ID {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "queue not found"})
+		return
+	}
+	steps := make([]db.EscalationStep, 0, len(payload.Steps))
+	for _, item := range payload.Steps {
+		var stepID uuid.UUID
+		if strings.TrimSpace(item.ID) != "" {
+			stepID, err = uuid.Parse(strings.TrimSpace(item.ID))
+			if err != nil {
+				jsonResponse(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("invalid escalation step id: %s", item.ID)})
+				return
+			}
+		}
+		steps = append(steps, db.EscalationStep{
+			ID:                      stepID,
+			QueueID:                 queueID,
+			ClockType:               item.ClockType,
+			DelayMinutesAfterBreach: item.DelayMinutesAfterBreach,
+			TargetType:              item.TargetType,
+			TargetValue:             item.TargetValue,
+			MessageTemplate:         item.MessageTemplate,
+			IsEnabled:               item.IsEnabled,
+		})
+	}
+	if err := a.store.ReplaceEscalationSteps(r.Context(), queueID, steps); err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	r.URL.RawQuery = url.Values{"queue_id": []string{queueID.String()}}.Encode()
+	a.handleListEscalationSteps(w, r)
+}
+
+func (a *App) handleUpsertQueues(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	var payload struct {
+		Queues []struct {
+			ID                  string `json:"id"`
+			Name                string `json:"name"`
+			Description         string `json:"description"`
+			DefaultPriority     string `json:"default_priority"`
+			DefaultRequestType  string `json:"default_request_type"`
+			EscalationChannelID string `json:"escalation_channel_id"`
+			IsDefault           bool   `json:"is_default"`
+			Policy              struct {
+				AckSLAMinutes        int    `json:"ack_sla_minutes"`
+				AssignSLAMinutes     int    `json:"assign_sla_minutes"`
+				StaleHours           int    `json:"stale_hours"`
+				DigestTime           string `json:"digest_time"`
+				DigestWeekday        *int   `json:"digest_weekday"`
+				AssignStartsFrom     string `json:"assign_starts_from"`
+				StaleStartsFrom      string `json:"stale_starts_from"`
+				Timezone             string `json:"timezone"`
+				BusinessHoursEnabled bool   `json:"business_hours_enabled"`
+				BusinessHoursStart   string `json:"business_hours_start"`
+				BusinessHoursEnd     string `json:"business_hours_end"`
+				BusinessDaysMask     int    `json:"business_days_mask"`
+			} `json:"policy"`
+			Members []struct {
+				UserID string `json:"user_id"`
+				Role   string `json:"role"`
+			} `json:"members"`
+		} `json:"queues"`
+	}
+	if err := readJSON(r, &payload); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	hasEnterprise, err := a.workspaceHasEnterprise(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	entitlements, err := a.workspaceEntitlements(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	existingQueues, err := a.store.ListQueues(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	queuedUpdates := map[string][]struct {
+		UserID string
+		Role   string
+	}{}
+	for _, item := range payload.Queues {
+		key := strings.TrimSpace(item.ID)
+		queuedUpdates[key] = make([]struct {
+			UserID string
+			Role   string
+		}, 0, len(item.Members))
+		for _, member := range item.Members {
+			queuedUpdates[key] = append(queuedUpdates[key], struct {
+				UserID string
+				Role   string
+			}{UserID: strings.TrimSpace(member.UserID), Role: strings.TrimSpace(member.Role)})
+		}
+	}
+	if entitlements.TriagerLimit != nil {
+		allTriagers := map[string]struct{}{}
+		for _, queue := range existingQueues {
+			key := queue.ID.String()
+			if replacements, ok := queuedUpdates[key]; ok {
+				for _, member := range replacements {
+					if member.UserID != "" && strings.EqualFold(member.Role, "triager") {
+						allTriagers[member.UserID] = struct{}{}
+					}
+				}
+				delete(queuedUpdates, key)
+				continue
+			}
+			members, _ := a.store.ListQueueMembers(r.Context(), queue.ID)
+			for _, member := range members {
+				if strings.EqualFold(member.Role, "triager") && strings.TrimSpace(member.UserID) != "" {
+					allTriagers[strings.TrimSpace(member.UserID)] = struct{}{}
+				}
+			}
+		}
+		for _, replacements := range queuedUpdates {
+			for _, member := range replacements {
+				if member.UserID != "" && strings.EqualFold(member.Role, "triager") {
+					allTriagers[member.UserID] = struct{}{}
+				}
+			}
+		}
+		if len(allTriagers) > *entitlements.TriagerLimit {
+			jsonResponse(w, http.StatusPaymentRequired, map[string]any{
+				"error": fmt.Sprintf("Team plan supports up to %d triagers across all queues. Upgrade in Billing to add more triagers.", *entitlements.TriagerLimit),
+			})
+			return
+		}
+	}
+
+	var sharedPolicy db.Policy
+	if !hasEnterprise {
+		sharedPolicy, err = a.store.GetPolicy(r.Context(), workspace.ID)
+		if err != nil {
+			jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
+	for _, item := range payload.Queues {
+		var queueID uuid.UUID
+		if strings.TrimSpace(item.ID) != "" {
+			parsed, err := uuid.Parse(strings.TrimSpace(item.ID))
+			if err != nil {
+				jsonResponse(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("invalid queue id: %s", item.ID)})
+				return
+			}
+			queueID = parsed
+		}
+		queue, err := a.store.UpsertQueue(r.Context(), db.Queue{
+			ID:                  queueID,
+			WorkspaceID:         workspace.ID,
+			Name:                strings.TrimSpace(item.Name),
+			Description:         optionalString(item.Description),
+			DefaultPriority:     item.DefaultPriority,
+			DefaultRequestType:  item.DefaultRequestType,
+			EscalationChannelID: optionalString(item.EscalationChannelID),
+			IsDefault:           item.IsDefault,
+		})
+		if err != nil {
+			jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		queuePolicy := db.QueuePolicy{
+			QueueID:              queue.ID,
+			AckSLAMinutes:        item.Policy.AckSLAMinutes,
+			AssignSLAMinutes:     item.Policy.AssignSLAMinutes,
+			StaleHours:           item.Policy.StaleHours,
+			DigestTime:           item.Policy.DigestTime,
+			DigestWeekday:        item.Policy.DigestWeekday,
+			AssignStartsFrom:     item.Policy.AssignStartsFrom,
+			StaleStartsFrom:      item.Policy.StaleStartsFrom,
+			Timezone:             item.Policy.Timezone,
+			BusinessHoursEnabled: item.Policy.BusinessHoursEnabled,
+			BusinessHoursStart:   optionalString(item.Policy.BusinessHoursStart),
+			BusinessHoursEnd:     optionalString(item.Policy.BusinessHoursEnd),
+			BusinessDaysMask:     item.Policy.BusinessDaysMask,
+		}
+		if !hasEnterprise {
+			queuePolicy = db.QueuePolicy{
+				QueueID:              queue.ID,
+				AckSLAMinutes:        sharedPolicy.AckSLAMinutes,
+				AssignSLAMinutes:     sharedPolicy.AssignSLAMinutes,
+				StaleHours:           sharedPolicy.StaleHours,
+				DigestTime:           sharedPolicy.DailyDigestTime,
+				DigestWeekday:        nil,
+				AssignStartsFrom:     "created_at",
+				StaleStartsFrom:      "last_human_activity_at",
+				Timezone:             sharedPolicy.Timezone,
+				BusinessHoursEnabled: false,
+				BusinessHoursStart:   nil,
+				BusinessHoursEnd:     nil,
+				BusinessDaysMask:     62,
+			}
+		}
+		if _, err := a.store.UpsertQueuePolicy(r.Context(), queuePolicy); err != nil {
+			jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		members := make([]db.QueueMember, 0, len(item.Members))
+		for _, member := range item.Members {
+			members = append(members, db.QueueMember{
+				QueueID: queue.ID,
+				UserID:  member.UserID,
+				Role:    member.Role,
+			})
+		}
+		if err := a.store.ReplaceQueueMembers(r.Context(), queue.ID, members); err != nil {
+			jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+	a.handleListQueues(w, r)
+}
+
+func (a *App) handleGetQueueDetail(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	queueID, err := uuid.Parse(strings.TrimSpace(chi.URLParam(r, "queueID")))
+	if err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "invalid queue id"})
+		return
+	}
+	detail, err := a.store.GetQueueDetailMetrics(r.Context(), queueID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			jsonResponse(w, http.StatusNotFound, map[string]any{"error": "queue not found"})
+			return
+		}
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	if detail.Queue.WorkspaceID != workspace.ID {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "queue not found"})
+		return
+	}
+	jsonResponse(w, http.StatusOK, detail)
+}
+
+func (a *App) handleSlackUsers(w http.ResponseWriter, r *http.Request) {
+	workspace, err := a.workspaceFromContext(r)
+	if err != nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
+		return
+	}
+	install, err := a.store.GetSlackInstallationByWorkspace(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "slack is not connected"})
+		return
+	}
+	users, err := a.slackClient.ListUsers(r.Context(), install.BotToken)
+	if err != nil {
+		jsonResponse(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"users": users})
 }
 
 func (a *App) handleSyncChannels(w http.ResponseWriter, r *http.Request) {
@@ -131,8 +570,9 @@ func (a *App) handleUpdateChannels(w http.ResponseWriter, r *http.Request) {
 	}
 	var payload struct {
 		Channels []struct {
-			ChannelID string `json:"channel_id"`
-			Enabled   bool   `json:"enabled"`
+			ChannelID      string `json:"channel_id"`
+			Enabled        bool   `json:"enabled"`
+			DefaultQueueID string `json:"default_queue_id"`
 		} `json:"channels"`
 	}
 	if err := readJSON(r, &payload); err != nil {
@@ -140,8 +580,19 @@ func (a *App) handleUpdateChannels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	updates := map[string]bool{}
+	defaultQueues := map[string]*uuid.UUID{}
 	for _, item := range payload.Channels {
 		updates[strings.TrimSpace(item.ChannelID)] = item.Enabled
+		if strings.TrimSpace(item.DefaultQueueID) == "" {
+			defaultQueues[strings.TrimSpace(item.ChannelID)] = nil
+			continue
+		}
+		queueID, err := uuid.Parse(strings.TrimSpace(item.DefaultQueueID))
+		if err != nil {
+			jsonResponse(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("invalid default_queue_id for channel %s", item.ChannelID)})
+			return
+		}
+		defaultQueues[strings.TrimSpace(item.ChannelID)] = &queueID
 	}
 
 	subscription, err := a.store.GetWorkspaceSubscriptionOrDefault(r.Context(), workspace.ID)
@@ -178,6 +629,12 @@ func (a *App) handleUpdateChannels(w http.ResponseWriter, r *http.Request) {
 	if err := a.store.UpdateChannelStates(r.Context(), workspace.ID, updates); err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
+	}
+	for channelID, queueID := range defaultQueues {
+		if err := a.store.SetChannelDefaultQueue(r.Context(), workspace.ID, channelID, queueID); err != nil {
+			jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
 	}
 	channels, _ := a.store.ListChannels(r.Context(), workspace.ID)
 	jsonResponse(w, http.StatusOK, map[string]any{"channels": channels})
@@ -413,6 +870,17 @@ func (a *App) handleUpdatePolicies(w http.ResponseWriter, r *http.Request) {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
+	hasEnterprise, err := a.workspaceHasEnterprise(r.Context(), workspace.ID)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	if !hasEnterprise {
+		if err := a.store.SyncWorkspacePolicyToQueues(r.Context(), workspace.ID, policy); err != nil {
+			jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+	}
 	updated, _ := a.store.GetPolicy(r.Context(), workspace.ID)
 	jsonResponse(w, http.StatusOK, updated)
 }
@@ -544,32 +1012,12 @@ func (a *App) handleRequestSummary(w http.ResponseWriter, r *http.Request) {
 		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "workspace not found"})
 		return
 	}
-
-	windowDays := parseWindowDays(r.URL.Query().Get("days"))
-
-	summary, overdue, err := a.store.RequestsSummary(r.Context(), workspace.ID)
+	dashboard, err := a.store.QueueDashboardAnalytics(r.Context(), workspace.ID)
 	if err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-
-	timezone := "UTC"
-	if policy, policyErr := a.store.GetPolicy(r.Context(), workspace.ID); policyErr == nil && strings.TrimSpace(policy.Timezone) != "" {
-		if _, tzErr := time.LoadLocation(policy.Timezone); tzErr == nil {
-			timezone = policy.Timezone
-		}
-	}
-	analytics, err := a.store.RequestAnalytics(r.Context(), workspace.ID, windowDays, timezone)
-	if err != nil {
-		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
-
-	jsonResponse(w, http.StatusOK, map[string]any{
-		"summary":   summary,
-		"overdue":   overdue,
-		"analytics": analytics,
-	})
+	jsonResponse(w, http.StatusOK, dashboard)
 }
 
 func (a *App) handleListRequests(w http.ResponseWriter, r *http.Request) {
@@ -590,7 +1038,36 @@ func (a *App) handleListRequests(w http.ResponseWriter, r *http.Request) {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	jsonResponse(w, http.StatusOK, map[string]any{"requests": requests})
+	queueCache := map[uuid.UUID]db.Queue{}
+	type requestDTO struct {
+		Request        db.Request           `json:"request"`
+		DerivedStatus  string               `json:"derived_status"`
+		Queue          *db.Queue            `json:"queue,omitempty"`
+		ClockStates    []db.RequestSLAClock `json:"clock_states"`
+		ExternalIssues []db.ExternalIssue   `json:"external_issues"`
+	}
+	items := make([]requestDTO, 0, len(requests))
+	for _, request := range requests {
+		var queue *db.Queue
+		if request.QueueID != nil {
+			if cached, ok := queueCache[*request.QueueID]; ok {
+				queue = &cached
+			} else if loaded, err := a.store.GetQueueByID(r.Context(), *request.QueueID); err == nil {
+				queueCache[loaded.ID] = loaded
+				queue = &loaded
+			}
+		}
+		clocks, _ := a.store.ListRequestSLAClocks(r.Context(), request.ID)
+		externalIssues, _ := a.store.ListExternalIssuesByRequest(r.Context(), request.ID)
+		items = append(items, requestDTO{
+			Request:        request,
+			DerivedStatus:  db.DerivedStatus(request),
+			Queue:          queue,
+			ClockStates:    clocks,
+			ExternalIssues: externalIssues,
+		})
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"requests": items})
 }
 
 func (a *App) handleActivity(w http.ResponseWriter, r *http.Request) {

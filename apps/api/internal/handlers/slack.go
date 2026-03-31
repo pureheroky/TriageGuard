@@ -78,8 +78,15 @@ type slackActionPayload struct {
 		PrivateMetadata string `json:"private_metadata"`
 		State           struct {
 			Values map[string]map[string]struct {
-				SelectedUser string `json:"selected_user"`
-				SelectedDate string `json:"selected_date"`
+				SelectedUser   string `json:"selected_user"`
+				SelectedDate   string `json:"selected_date"`
+				Value          string `json:"value"`
+				SelectedOption struct {
+					Value string `json:"value"`
+				} `json:"selected_option"`
+				SelectedOptions []struct {
+					Value string `json:"value"`
+				} `json:"selected_options"`
 			} `json:"values"`
 		} `json:"state"`
 	} `json:"view"`
@@ -428,40 +435,112 @@ func (a *App) handleBlockAction(ctx context.Context, payload slackActionPayload)
 	workspaceID := install.WorkspaceID
 
 	switch action.ActionID {
-	case "tg_assign":
-		return a.slackClient.OpenView(ctx, install.BotToken, payload.TriggerID, slack.RenderAssignModal(action.Value))
-	case "tg_due":
-		return a.slackClient.OpenView(ctx, install.BotToken, payload.TriggerID, slack.RenderDueModal(action.Value))
+	case "tg_triage":
+		requestID, err := parseUUID(action.Value)
+		if err != nil {
+			return err
+		}
+		request, err := a.store.GetRequestByID(ctx, requestID)
+		if err != nil {
+			return err
+		}
+		queues, err := a.store.ListQueues(ctx, request.WorkspaceID)
+		if err != nil {
+			return err
+		}
+		return a.slackClient.OpenView(ctx, install.BotToken, payload.TriggerID, slack.RenderTriageModal(request, queues))
 	case "tg_ack":
 		requestID, err := parseUUID(action.Value)
 		if err != nil {
 			return err
 		}
-		if err := a.store.SetAck(ctx, requestID); err != nil {
+		ack := true
+		if _, _, err := a.store.ApplyRequestMutation(ctx, db.RequestMutation{
+			RequestID:   requestID,
+			ActorType:   "slack_user",
+			ActorID:     optionalString(payload.User.ID),
+			Acknowledge: &ack,
+		}); err != nil {
 			return err
 		}
 		_ = a.store.InsertAction(ctx, db.RequestAction{RequestID: requestID, ActorSlackID: payload.User.ID, ActionType: "ACK"})
 		return a.refreshTriageCard(ctx, install, requestID)
-	case "tg_ignore":
+	case "tg_assign_me":
 		requestID, err := parseUUID(action.Value)
 		if err != nil {
 			return err
 		}
-		if err := a.store.SetIgnore(ctx, requestID); err != nil {
+		owner := strings.TrimSpace(payload.User.ID)
+		if owner == "" {
+			return nil
+		}
+		if _, _, err := a.store.ApplyRequestMutation(ctx, db.RequestMutation{
+			RequestID:   requestID,
+			ActorType:   "slack_user",
+			ActorID:     optionalString(payload.User.ID),
+			OwnerUserID: &owner,
+		}); err != nil {
 			return err
 		}
-		_ = a.store.InsertAction(ctx, db.RequestAction{RequestID: requestID, ActorSlackID: payload.User.ID, ActionType: "IGNORE"})
+		_ = a.store.InsertAction(ctx, db.RequestAction{RequestID: requestID, ActorSlackID: payload.User.ID, ActionType: "ASSIGN_ME"})
 		if err := a.refreshTriageCard(ctx, install, requestID); err != nil {
 			return err
 		}
 		a.trySyncLinkedLinearIssueFromSlackInChannel(ctx, install, requestID, &workspaceID, channelID, payload.User.ID)
 		return nil
+	case "tg_waiting_requester":
+		requestID, err := parseUUID(action.Value)
+		if err != nil {
+			return err
+		}
+		waitingOn := db.WaitingOnRequester
+		comment := "Waiting on requester"
+		if _, _, err := a.store.ApplyRequestMutation(ctx, db.RequestMutation{
+			RequestID: requestID,
+			ActorType: "slack_user",
+			ActorID:   optionalString(payload.User.ID),
+			WaitingOn: &waitingOn,
+			Comment:   &comment,
+		}); err != nil {
+			return err
+		}
+		_ = a.store.InsertAction(ctx, db.RequestAction{RequestID: requestID, ActorSlackID: payload.User.ID, ActionType: "WAITING_REQUESTER"})
+		return a.refreshTriageCard(ctx, install, requestID)
+	case "tg_snooze_tomorrow":
+		requestID, err := parseUUID(action.Value)
+		if err != nil {
+			return err
+		}
+		request, err := a.store.GetRequestByID(ctx, requestID)
+		if err != nil {
+			return err
+		}
+		snoozedUntil, err := a.resolveSnoozeSelection(ctx, request, "tomorrow", "")
+		if err != nil {
+			return err
+		}
+		if _, _, err := a.store.ApplyRequestMutation(ctx, db.RequestMutation{
+			RequestID:    requestID,
+			ActorType:    "slack_user",
+			ActorID:      optionalString(payload.User.ID),
+			SnoozedUntil: &snoozedUntil,
+		}); err != nil {
+			return err
+		}
+		_ = a.store.InsertAction(ctx, db.RequestAction{RequestID: requestID, ActorSlackID: payload.User.ID, ActionType: "SNOOZE_TOMORROW"})
+		return a.refreshTriageCard(ctx, install, requestID)
 	case "tg_resolve":
 		requestID, err := parseUUID(action.Value)
 		if err != nil {
 			return err
 		}
-		if err := a.store.SetResolve(ctx, requestID); err != nil {
+		reason := db.ClosedReasonResolved
+		if _, _, err := a.store.ApplyRequestMutation(ctx, db.RequestMutation{
+			RequestID:   requestID,
+			ActorType:   "slack_user",
+			ActorID:     optionalString(payload.User.ID),
+			CloseReason: &reason,
+		}); err != nil {
 			return err
 		}
 		_ = a.store.InsertAction(ctx, db.RequestAction{RequestID: requestID, ActorSlackID: payload.User.ID, ActionType: "RESOLVE"})
@@ -475,7 +554,12 @@ func (a *App) handleBlockAction(ctx context.Context, payload slackActionPayload)
 		if err != nil {
 			return err
 		}
-		if err := a.store.SetReopen(ctx, requestID); err != nil {
+		if _, _, err := a.store.ApplyRequestMutation(ctx, db.RequestMutation{
+			RequestID: requestID,
+			ActorType: "slack_user",
+			ActorID:   optionalString(payload.User.ID),
+			Reopen:    true,
+		}); err != nil {
 			return err
 		}
 		_ = a.store.InsertAction(ctx, db.RequestAction{RequestID: requestID, ActorSlackID: payload.User.ID, ActionType: "REOPEN"})
@@ -484,214 +568,54 @@ func (a *App) handleBlockAction(ctx context.Context, payload slackActionPayload)
 		}
 		a.trySyncLinkedLinearIssueFromSlackInChannel(ctx, install, requestID, &workspaceID, channelID, payload.User.ID)
 		return nil
-	case "tg_priority":
-		parts := strings.Split(action.SelectedOption.Value, "|")
-		if len(parts) != 2 {
-			return fmt.Errorf("invalid priority value")
-		}
-		priority := parts[0]
-		requestID, err := parseUUID(parts[1])
+	case "tg_more":
+		command, requestID, err := parseOverflowAction(action.SelectedOption.Value)
 		if err != nil {
-			return err
-		}
-		if err := a.store.SetPriority(ctx, requestID, priority); err != nil {
-			return err
-		}
-		payloadJSON, _ := json.Marshal(map[string]any{"priority": priority})
-		_ = a.store.InsertAction(ctx, db.RequestAction{RequestID: requestID, ActorSlackID: payload.User.ID, ActionType: "PRIORITY", Payload: payloadJSON})
-		return a.refreshTriageCard(ctx, install, requestID)
-	case "tg_convert":
-		requestID, err := parseUUID(action.Value)
-		if err != nil {
-			return err
-		}
-		a.logger.Printf("convert linear: started request_id=%s team=%s user=%s", requestID, payload.Team.ID, payload.User.ID)
-		if existing, err := a.store.GetLinearIssueByRequest(ctx, requestID); err == nil && existing.IssueURL != "" {
-			a.logger.Printf("convert linear: already linked request_id=%s issue_url=%s", requestID, existing.IssueURL)
-			return a.refreshTriageCard(ctx, install, requestID)
-		} else if err != nil && !errorsIsNoRows(err) {
 			return err
 		}
 		request, err := a.store.GetRequestByID(ctx, requestID)
 		if err != nil {
 			return err
 		}
-		if request.Status == "IGNORED" || request.Status == "RESOLVED" {
-			return nil
-		}
-		if _, err := a.store.GetLinearInstallation(ctx, request.WorkspaceID); err != nil {
-			if errorsIsNoRows(err) {
-				return a.slackClient.PostEphemeral(ctx, install.BotToken, request.ChannelID, payload.User.ID, "Connect Linear in Admin Console.")
-			}
-			return err
-		}
-		policy, err := a.store.GetPolicy(ctx, request.WorkspaceID)
-		if err != nil {
-			return err
-		}
-		if policy.LinearTeamID == nil || *policy.LinearTeamID == "" {
-			return a.slackClient.PostEphemeral(ctx, install.BotToken, request.ChannelID, payload.User.ID, "Set Linear teamId in Admin Console first.")
-		}
-		threadURL := buildThreadURL(install.TeamDomain, request.ChannelID, request.ThreadTS)
-		title := "Triage: "
-		if request.Title != nil && *request.Title != "" {
-			title += *request.Title
-		} else {
-			title += request.BodyText
-		}
-
-		loc := time.UTC
-		if policy.Timezone != "" {
-			if loadedLoc, err := time.LoadLocation(policy.Timezone); err == nil {
-				loc = loadedLoc
-			}
-		}
-
-		ownerDisplay := "Unassigned"
-		callLinear := func(run func(token string) error) error {
-			return a.withLinearAccessToken(ctx, request.WorkspaceID, run)
-		}
-
-		var assigneeID *string
-		if request.OwnerSlackID != nil && *request.OwnerSlackID != "" {
-			ownerID := strings.TrimSpace(*request.OwnerSlackID)
-			ownerDisplay = ownerID
-			displayName, displayErr := a.slackClient.GetUserDisplayName(ctx, install.BotToken, ownerID)
-			if displayErr != nil {
-				a.logger.Printf("convert linear: resolve slack owner display name failed request_id=%s owner=%s: %v", request.ID, ownerID, displayErr)
-			} else if strings.TrimSpace(displayName) != "" {
-				ownerDisplay = strings.TrimSpace(displayName)
-			}
-			email, err := a.slackClient.GetUserEmail(ctx, install.BotToken, *request.OwnerSlackID)
-			if err != nil {
-				a.logger.Printf("convert linear: resolve slack owner email failed request_id=%s owner=%s: %v", request.ID, *request.OwnerSlackID, err)
-			} else if email != "" {
-				var linearUserID string
-				if err := callLinear(func(token string) error {
-					resolvedID, err := a.linearClient.FindUserIDByEmail(ctx, token, email)
-					if err != nil {
-						return err
-					}
-					linearUserID = resolvedID
-					return nil
-				}); err != nil {
-					if linear.IsAuthError(err) || strings.Contains(strings.ToLower(err.Error()), "linear auth required") {
-						return fmt.Errorf("linear auth required: reconnect Linear in Admin Console")
-					}
-					a.logger.Printf("convert linear: find linear user by email failed request_id=%s email=%s: %v", request.ID, email, err)
-				} else if linearUserID != "" {
-					assigneeID = &linearUserID
-					a.logger.Printf("convert linear: resolved assignee request_id=%s slack_owner=%s email=%s linear_user=%s", request.ID, *request.OwnerSlackID, email, linearUserID)
-				} else {
-					a.logger.Printf("convert linear: no linear user match request_id=%s slack_owner=%s email=%s", request.ID, *request.OwnerSlackID, email)
-				}
-			} else {
-				a.logger.Printf("convert linear: slack owner email empty request_id=%s owner=%s (missing users:read.email or hidden email)", request.ID, *request.OwnerSlackID)
-			}
-		}
-
-		dueDisplay := "—"
-		var dueDateForLinear *string
-		if request.DueAt != nil {
-			formattedDueDate := request.DueAt.In(loc).Format("2006-01-02")
-			dueDisplay = formattedDueDate
-			dueDateForLinear = &formattedDueDate
-		}
-
-		var stateID *string
-		desiredStateType := linearStateTypeForRequestStatus(request.Status)
-		if desiredStateType != "" {
-			var states []linear.WorkflowState
-			if err := callLinear(func(token string) error {
-				fetchedStates, err := a.linearClient.ListTeamStates(ctx, token, *policy.LinearTeamID)
-				if err != nil {
-					return err
-				}
-				states = fetchedStates
-				return nil
-			}); err != nil {
-				if linear.IsAuthError(err) || strings.Contains(strings.ToLower(err.Error()), "linear auth required") {
-					return fmt.Errorf("linear auth required: reconnect Linear in Admin Console")
-				}
-				a.logger.Printf("convert linear: list team states failed request_id=%s: %v", request.ID, err)
-			} else if selectedStateID := pickLinearStateID(states, desiredStateType); selectedStateID != "" {
-				stateID = &selectedStateID
-			}
-		}
-
-		descriptionLines := []string{
-			request.BodyText,
-			"",
-			"*TriageGuard metadata*",
-			fmt.Sprintf("- Status: %s", request.Status),
-			fmt.Sprintf("- Priority: %s", request.Priority),
-			fmt.Sprintf("- Assignee (Slack): %s", ownerDisplay),
-			fmt.Sprintf("- Due date: %s", dueDisplay),
-		}
-		if threadURL != "" {
-			descriptionLines = append(descriptionLines, "- Slack thread: "+threadURL)
-		}
-
-		var issue linear.CreatedIssue
-		if err := callLinear(func(token string) error {
-			createdIssue, err := a.linearClient.CreateIssue(ctx, token, linear.CreateIssueInput{
-				TeamID:      *policy.LinearTeamID,
-				Title:       title,
-				Description: strings.Join(descriptionLines, "\n"),
-				AssigneeID:  assigneeID,
-				DueDate:     dueDateForLinear,
-				StateID:     stateID,
-			})
+		switch command {
+		case "waiting":
+			return a.slackClient.OpenView(ctx, install.BotToken, payload.TriggerID, slack.RenderWaitingModal(request))
+		case "snooze":
+			return a.slackClient.OpenView(ctx, install.BotToken, payload.TriggerID, slack.RenderSnoozeModal(request))
+		case "reassign":
+			queues, err := a.store.ListQueues(ctx, request.WorkspaceID)
 			if err != nil {
 				return err
 			}
-			issue = createdIssue
-			return nil
-		}); err != nil {
-			if linear.IsAuthError(err) || strings.Contains(strings.ToLower(err.Error()), "linear auth required") {
-				return fmt.Errorf("linear auth required: reconnect Linear in Admin Console")
-			}
-			a.logger.Printf("convert linear: create issue failed request_id=%s: %v", request.ID, err)
-			return err
-		}
-		if assigneeID != nil || dueDateForLinear != nil || stateID != nil {
-			if err := callLinear(func(token string) error {
-				return a.linearClient.UpdateIssue(ctx, token, linear.UpdateIssueInput{
-					IssueID:     issue.ID,
-					AssigneeID:  assigneeID,
-					DueDate:     dueDateForLinear,
-					StateID:     stateID,
-					SetAssignee: assigneeID != nil,
-					SetDueDate:  dueDateForLinear != nil,
-					SetState:    stateID != nil,
-				})
+			return a.slackClient.OpenView(ctx, install.BotToken, payload.TriggerID, slack.RenderTriageModal(request, queues))
+		case "tracker":
+			return a.handleTrackerLinkAction(ctx, install, requestID, channelID, payload.User.ID, &workspaceID)
+		case "close":
+			return a.slackClient.OpenView(ctx, install.BotToken, payload.TriggerID, slack.RenderCloseModal(request))
+		case "reopen":
+			if _, _, err := a.store.ApplyRequestMutation(ctx, db.RequestMutation{
+				RequestID: requestID,
+				ActorType: "slack_user",
+				ActorID:   optionalString(payload.User.ID),
+				Reopen:    true,
 			}); err != nil {
-				a.logger.Printf("convert linear: issue update fallback failed request_id=%s issue_id=%s: %v", request.ID, issue.ID, err)
+				return err
 			}
+			_ = a.store.InsertAction(ctx, db.RequestAction{RequestID: requestID, ActorSlackID: payload.User.ID, ActionType: "REOPEN"})
+			if err := a.refreshTriageCard(ctx, install, requestID); err != nil {
+				return err
+			}
+			a.trySyncLinkedLinearIssueFromSlackInChannel(ctx, install, requestID, &workspaceID, channelID, payload.User.ID)
+			return nil
+		default:
+			return nil
 		}
-		if err := a.store.UpsertLinearIssue(ctx, db.LinearIssue{RequestID: requestID, IssueID: issue.ID, IssueURL: issue.URL}); err != nil {
+	case "tg_convert":
+		requestID, err := parseUUID(action.Value)
+		if err != nil {
 			return err
 		}
-		payloadJSON, _ := json.Marshal(map[string]any{
-			"issue_id":        issue.ID,
-			"issue_url":       issue.URL,
-			"linear_state_id": stateID,
-			"assignee_id":     assigneeID,
-			"due_date":        dueDateForLinear,
-		})
-		_ = a.store.InsertAction(ctx, db.RequestAction{RequestID: requestID, ActorSlackID: payload.User.ID, ActionType: "CONVERT", Payload: payloadJSON})
-		a.logger.Printf(
-			"convert linear: created issue request_id=%s issue_id=%s assignee_requested=%t assignee_applied=%t state_requested=%t state_applied=%t due_requested=%t due_applied=%t",
-			request.ID,
-			issue.ID,
-			assigneeID != nil,
-			issue.AssigneeID != nil,
-			stateID != nil,
-			issue.StateID != nil,
-			dueDateForLinear != nil,
-			issue.DueDate != nil,
-		)
-		return a.refreshTriageCard(ctx, install, requestID)
+		return a.handleTrackerLinkAction(ctx, install, requestID, channelID, payload.User.ID, &workspaceID)
 	default:
 		return nil
 	}
@@ -729,12 +653,164 @@ func (a *App) handleViewSubmission(ctx context.Context, payload slackActionPaylo
 	workspaceID := install.WorkspaceID
 
 	switch payload.View.CallbackID {
+	case "tg_triage_submit":
+		ack := checkboxHasValue(payload, "ack_block", "ack_checkbox", "ack")
+		owner := strings.TrimSpace(selectedUserValue(payload, "owner_block", "owner_select"))
+		priority := strings.TrimSpace(selectedOptionValue(payload, "priority_block", "priority_select"))
+		requestType := strings.TrimSpace(selectedOptionValue(payload, "type_block", "type_select"))
+		queueIDValue := strings.TrimSpace(selectedOptionValue(payload, "queue_block", "queue_select"))
+		waitingOn := strings.TrimSpace(selectedOptionValue(payload, "waiting_block", "waiting_select"))
+		dueSelected := strings.TrimSpace(selectedDateValue(payload, "due_block", "due_picker"))
+		snoozeSelected := strings.TrimSpace(selectedDateValue(payload, "snooze_block", "snooze_picker"))
+		linkTracker := checkboxHasValue(payload, "tracker_block", "tracker_checkbox", "link_tracker")
+
+		var queueID *uuid.UUID
+		if queueIDValue != "" {
+			parsedQueueID, err := uuid.Parse(queueIDValue)
+			if err != nil {
+				return err
+			}
+			queueID = &parsedQueueID
+		}
+		var dueAt *time.Time
+		if dueSelected != "" {
+			resolvedDueAt, err := a.parseSlackSelectedDate(ctx, req, queueID, dueSelected)
+			if err != nil {
+				return err
+			}
+			dueAt = resolvedDueAt
+		}
+		var snoozedUntil *time.Time
+		if snoozeSelected != "" {
+			resolvedSnooze, err := a.parseSlackSelectedDate(ctx, req, queueID, snoozeSelected)
+			if err != nil {
+				return err
+			}
+			snoozedUntil = resolvedSnooze
+		}
+		actorID := optionalString(payload.User.ID)
+		mutation := db.RequestMutation{
+			RequestID:    requestID,
+			ActorType:    "slack_user",
+			ActorID:      actorID,
+			DueAt:        &dueAt,
+			SnoozedUntil: &snoozedUntil,
+		}
+		if ack {
+			mutation.Acknowledge = &ack
+		}
+		if owner != "" {
+			mutation.OwnerUserID = &owner
+		}
+		if priority != "" {
+			mutation.Priority = &priority
+		}
+		if requestType != "" {
+			mutation.RequestType = &requestType
+		}
+		if queueID != nil {
+			mutation.QueueID = queueID
+		}
+		if waitingOn != "" {
+			mutation.WaitingOn = &waitingOn
+		}
+		if linkTracker {
+			mutation.LinkTracker = &linkTracker
+		}
+		if _, _, err := a.store.ApplyRequestMutation(ctx, mutation); err != nil {
+			return err
+		}
+		payloadJSON, _ := json.Marshal(map[string]any{
+			"ack":           ack,
+			"owner":         owner,
+			"priority":      priority,
+			"request_type":  requestType,
+			"queue_id":      queueIDValue,
+			"waiting_on":    waitingOn,
+			"due_date":      dueSelected,
+			"snoozed_until": snoozeSelected,
+			"link_tracker":  linkTracker,
+		})
+		_ = a.store.InsertAction(ctx, db.RequestAction{RequestID: requestID, ActorSlackID: payload.User.ID, ActionType: "TRIAGE", Payload: payloadJSON})
+		if err := a.refreshTriageCard(ctx, install, requestID); err != nil {
+			return err
+		}
+		if linkTracker {
+			return a.handleTrackerLinkAction(ctx, install, requestID, req.ChannelID, payload.User.ID, &workspaceID)
+		}
+		a.trySyncLinkedLinearIssueFromSlackInChannel(ctx, install, requestID, &workspaceID, req.ChannelID, payload.User.ID)
+		return nil
+	case "tg_waiting_submit":
+		waitingOn := selectedOptionValue(payload, "waiting_block", "waiting_select")
+		comment := textInputValue(payload, "comment_block", "comment_input")
+		reviewSelected := selectedDateValue(payload, "review_block", "review_picker")
+		var snoozedUntil *time.Time
+		if reviewSelected != "" {
+			resolved, err := a.parseSlackSelectedDate(ctx, req, req.QueueID, reviewSelected)
+			if err != nil {
+				return err
+			}
+			snoozedUntil = resolved
+		}
+		if _, _, err := a.store.ApplyRequestMutation(ctx, db.RequestMutation{
+			RequestID:    requestID,
+			ActorType:    "slack_user",
+			ActorID:      optionalString(payload.User.ID),
+			WaitingOn:    &waitingOn,
+			SnoozedUntil: &snoozedUntil,
+			Comment:      &comment,
+		}); err != nil {
+			return err
+		}
+		payloadJSON, _ := json.Marshal(map[string]any{"waiting_on": waitingOn, "comment": comment, "review_date": reviewSelected})
+		_ = a.store.InsertAction(ctx, db.RequestAction{RequestID: requestID, ActorSlackID: payload.User.ID, ActionType: "WAITING", Payload: payloadJSON})
+		return a.refreshTriageCard(ctx, install, requestID)
+	case "tg_snooze_submit":
+		preset := selectedOptionValue(payload, "preset_block", "preset_select")
+		customSelected := selectedDateValue(payload, "custom_block", "custom_picker")
+		snoozedUntil, err := a.resolveSnoozeSelection(ctx, req, preset, customSelected)
+		if err != nil {
+			return err
+		}
+		if _, _, err := a.store.ApplyRequestMutation(ctx, db.RequestMutation{
+			RequestID:    requestID,
+			ActorType:    "slack_user",
+			ActorID:      optionalString(payload.User.ID),
+			SnoozedUntil: &snoozedUntil,
+		}); err != nil {
+			return err
+		}
+		payloadJSON, _ := json.Marshal(map[string]any{"preset": preset, "custom_date": customSelected})
+		_ = a.store.InsertAction(ctx, db.RequestAction{RequestID: requestID, ActorSlackID: payload.User.ID, ActionType: "SNOOZE", Payload: payloadJSON})
+		return a.refreshTriageCard(ctx, install, requestID)
+	case "tg_close_submit":
+		reason := selectedOptionValue(payload, "close_block", "close_select")
+		if _, _, err := a.store.ApplyRequestMutation(ctx, db.RequestMutation{
+			RequestID:   requestID,
+			ActorType:   "slack_user",
+			ActorID:     optionalString(payload.User.ID),
+			CloseReason: &reason,
+		}); err != nil {
+			return err
+		}
+		payloadJSON, _ := json.Marshal(map[string]any{"closed_reason": reason})
+		_ = a.store.InsertAction(ctx, db.RequestAction{RequestID: requestID, ActorSlackID: payload.User.ID, ActionType: "CLOSE", Payload: payloadJSON})
+		if err := a.refreshTriageCard(ctx, install, requestID); err != nil {
+			return err
+		}
+		a.trySyncLinkedLinearIssueFromSlackInChannel(ctx, install, requestID, &workspaceID, req.ChannelID, payload.User.ID)
+		return nil
 	case "tg_assign_submit":
 		owner := payload.View.State.Values["owner_block"]["owner_select"].SelectedUser
 		if owner == "" {
 			return nil
 		}
-		if err := a.store.SetAssign(ctx, requestID, owner); err != nil {
+		if _, _, err := a.store.ApplyRequestMutation(ctx, db.RequestMutation{
+			RequestID:   requestID,
+			ActorType:   "slack_user",
+			ActorID:     optionalString(payload.User.ID),
+			OwnerUserID: &owner,
+		}); err != nil {
 			return err
 		}
 		p, _ := json.Marshal(map[string]any{"owner": owner})
@@ -763,7 +839,12 @@ func (a *App) handleViewSubmission(ctx context.Context, payload slackActionPaylo
 			eod := time.Date(t.Year(), t.Month(), t.Day(), 23, 59, 59, 0, loc).UTC()
 			dueAt = &eod
 		}
-		if err := a.store.SetDue(ctx, requestID, dueAt); err != nil {
+		if _, _, err := a.store.ApplyRequestMutation(ctx, db.RequestMutation{
+			RequestID: requestID,
+			ActorType: "slack_user",
+			ActorID:   optionalString(payload.User.ID),
+			DueAt:     &dueAt,
+		}); err != nil {
 			return err
 		}
 		p, _ := json.Marshal(map[string]any{"due_date": selected})
@@ -778,25 +859,350 @@ func (a *App) handleViewSubmission(ctx context.Context, payload slackActionPaylo
 	}
 }
 
+func selectedUserValue(payload slackActionPayload, blockID, actionID string) string {
+	return payload.View.State.Values[blockID][actionID].SelectedUser
+}
+
+func selectedDateValue(payload slackActionPayload, blockID, actionID string) string {
+	return payload.View.State.Values[blockID][actionID].SelectedDate
+}
+
+func selectedOptionValue(payload slackActionPayload, blockID, actionID string) string {
+	return payload.View.State.Values[blockID][actionID].SelectedOption.Value
+}
+
+func textInputValue(payload slackActionPayload, blockID, actionID string) string {
+	return payload.View.State.Values[blockID][actionID].Value
+}
+
+func checkboxHasValue(payload slackActionPayload, blockID, actionID, expected string) bool {
+	for _, option := range payload.View.State.Values[blockID][actionID].SelectedOptions {
+		if strings.TrimSpace(option.Value) == strings.TrimSpace(expected) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseOverflowAction(raw string) (string, uuid.UUID, error) {
+	parts := strings.SplitN(strings.TrimSpace(raw), "|", 2)
+	if len(parts) != 2 {
+		return "", uuid.Nil, fmt.Errorf("invalid overflow action")
+	}
+	requestID, err := uuid.Parse(parts[1])
+	if err != nil {
+		return "", uuid.Nil, err
+	}
+	return strings.TrimSpace(parts[0]), requestID, nil
+}
+
+func (a *App) parseSlackSelectedDate(ctx context.Context, req db.Request, queueID *uuid.UUID, selected string) (*time.Time, error) {
+	timezone := "UTC"
+	if queueID != nil {
+		if policy, err := a.store.GetQueuePolicy(ctx, *queueID); err == nil && strings.TrimSpace(policy.Timezone) != "" {
+			timezone = policy.Timezone
+		}
+	} else if req.QueueID != nil {
+		if policy, err := a.store.GetQueuePolicy(ctx, *req.QueueID); err == nil && strings.TrimSpace(policy.Timezone) != "" {
+			timezone = policy.Timezone
+		}
+	}
+	if timezone == "UTC" {
+		if policy, err := a.store.GetPolicy(ctx, req.WorkspaceID); err == nil && strings.TrimSpace(policy.Timezone) != "" {
+			timezone = policy.Timezone
+		}
+	}
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	t, err := time.ParseInLocation("2006-01-02", selected, loc)
+	if err != nil {
+		return nil, err
+	}
+	eod := time.Date(t.Year(), t.Month(), t.Day(), 23, 59, 59, 0, loc).UTC()
+	return &eod, nil
+}
+
+func (a *App) resolveSnoozeSelection(ctx context.Context, req db.Request, preset, customSelected string) (*time.Time, error) {
+	now := time.Now().UTC()
+	switch strings.TrimSpace(preset) {
+	case "4_hours":
+		value := now.Add(4 * time.Hour)
+		return &value, nil
+	case "tomorrow":
+		return a.nextBusinessStart(ctx, req, now)
+	case "next_monday":
+		loc := time.UTC
+		local := now.In(loc)
+		for i := 1; i <= 7; i++ {
+			candidate := local.AddDate(0, 0, i)
+			if candidate.Weekday() == time.Monday {
+				eod := time.Date(candidate.Year(), candidate.Month(), candidate.Day(), 23, 59, 59, 0, loc).UTC()
+				return &eod, nil
+			}
+		}
+	case "custom":
+		if customSelected != "" {
+			return a.parseSlackSelectedDate(ctx, req, req.QueueID, customSelected)
+		}
+	}
+	if customSelected != "" {
+		return a.parseSlackSelectedDate(ctx, req, req.QueueID, customSelected)
+	}
+	return nil, nil
+}
+
+func (a *App) nextBusinessStart(ctx context.Context, req db.Request, now time.Time) (*time.Time, error) {
+	policy := db.QueuePolicy{}
+	if req.QueueID != nil {
+		loaded, err := a.store.GetQueuePolicy(ctx, *req.QueueID)
+		if err == nil {
+			policy = loaded
+			return nextBusinessStartForPolicy(loaded, now), nil
+		}
+	}
+	return nextBusinessStartForPolicy(policy, now), nil
+}
+
+func nextBusinessStartForPolicy(policy db.QueuePolicy, now time.Time) *time.Time {
+	loc := time.UTC
+	if strings.TrimSpace(policy.Timezone) != "" {
+		if zone, err := time.LoadLocation(policy.Timezone); err == nil {
+			loc = zone
+		}
+	}
+	local := now.In(loc)
+	if policy.BusinessHoursEnabled {
+		startHour, startMinute, startSecond := 9, 0, 0
+		if policy.BusinessHoursStart != nil {
+			if parsed, err := time.ParseInLocation("15:04:05", *policy.BusinessHoursStart, loc); err == nil {
+				startHour, startMinute, startSecond = parsed.Hour(), parsed.Minute(), parsed.Second()
+			}
+		}
+		for offset := 1; offset <= 7; offset++ {
+			candidate := local.AddDate(0, 0, offset)
+			weekdayMask := 1 << int(candidate.Weekday())
+			if policy.BusinessDaysMask != 0 && policy.BusinessDaysMask&weekdayMask == 0 {
+				continue
+			}
+			value := time.Date(candidate.Year(), candidate.Month(), candidate.Day(), startHour, startMinute, startSecond, 0, loc).UTC()
+			return &value
+		}
+	}
+	candidate := local.AddDate(0, 0, 1)
+	value := time.Date(candidate.Year(), candidate.Month(), candidate.Day(), 9, 0, 0, 0, loc).UTC()
+	return &value
+}
+
+func (a *App) handleTrackerLinkAction(ctx context.Context, install db.SlackInstallation, requestID uuid.UUID, channelID, slackUserID string, workspaceID *uuid.UUID) error {
+	a.logger.Printf("tracker link: started request_id=%s team=%s user=%s", requestID, install.TeamID, slackUserID)
+	if existing, err := a.store.GetLinearIssueByRequest(ctx, requestID); err == nil && existing.IssueURL != "" {
+		a.logger.Printf("tracker link: already linked request_id=%s issue_url=%s", requestID, existing.IssueURL)
+		return a.refreshTriageCard(ctx, install, requestID)
+	} else if err != nil && !errorsIsNoRows(err) {
+		return err
+	}
+	request, err := a.store.GetRequestByID(ctx, requestID)
+	if err != nil {
+		return err
+	}
+	if request.State == db.RequestStateClosed {
+		return nil
+	}
+	if _, err := a.store.GetLinearInstallation(ctx, request.WorkspaceID); err != nil {
+		if errorsIsNoRows(err) {
+			return a.slackClient.PostEphemeral(ctx, install.BotToken, request.ChannelID, slackUserID, "Connect Linear in Admin Console.")
+		}
+		return err
+	}
+	policy, err := a.store.GetPolicy(ctx, request.WorkspaceID)
+	if err != nil {
+		return err
+	}
+	if policy.LinearTeamID == nil || *policy.LinearTeamID == "" {
+		return a.slackClient.PostEphemeral(ctx, install.BotToken, request.ChannelID, slackUserID, "Set Linear team in Admin Console first.")
+	}
+	threadURL := buildThreadURL(install.TeamDomain, request.ChannelID, request.ThreadTS)
+	title := "Triage: "
+	if request.Title != nil && *request.Title != "" {
+		title += *request.Title
+	} else {
+		title += request.BodyText
+	}
+
+	loc := time.UTC
+	if policy.Timezone != "" {
+		if loadedLoc, err := time.LoadLocation(policy.Timezone); err == nil {
+			loc = loadedLoc
+		}
+	}
+
+	ownerDisplay := "Unassigned"
+	callLinear := func(run func(token string) error) error {
+		return a.withLinearAccessToken(ctx, request.WorkspaceID, run)
+	}
+
+	var assigneeID *string
+	if request.OwnerUserID != nil && *request.OwnerUserID != "" {
+		ownerID := strings.TrimSpace(*request.OwnerUserID)
+		ownerDisplay = ownerID
+		displayName, displayErr := a.slackClient.GetUserDisplayName(ctx, install.BotToken, ownerID)
+		if displayErr != nil {
+			a.logger.Printf("tracker link: resolve slack owner display name failed request_id=%s owner=%s: %v", request.ID, ownerID, displayErr)
+		} else if strings.TrimSpace(displayName) != "" {
+			ownerDisplay = strings.TrimSpace(displayName)
+		}
+		email, err := a.slackClient.GetUserEmail(ctx, install.BotToken, ownerID)
+		if err != nil {
+			a.logger.Printf("tracker link: resolve slack owner email failed request_id=%s owner=%s: %v", request.ID, ownerID, err)
+		} else if email != "" {
+			var linearUserID string
+			if err := callLinear(func(token string) error {
+				resolvedID, err := a.linearClient.FindUserIDByEmail(ctx, token, email)
+				if err != nil {
+					return err
+				}
+				linearUserID = resolvedID
+				return nil
+			}); err != nil {
+				if linear.IsAuthError(err) || strings.Contains(strings.ToLower(err.Error()), "linear auth required") {
+					return fmt.Errorf("linear auth required: reconnect Linear in Admin Console")
+				}
+				a.logger.Printf("tracker link: find linear user by email failed request_id=%s email=%s: %v", request.ID, email, err)
+			} else if linearUserID != "" {
+				assigneeID = &linearUserID
+			}
+		}
+	}
+
+	dueDisplay := "—"
+	var dueDateForLinear *string
+	if request.DueAt != nil {
+		formattedDueDate := request.DueAt.In(loc).Format("2006-01-02")
+		dueDisplay = formattedDueDate
+		dueDateForLinear = &formattedDueDate
+	}
+
+	var stateID *string
+	desiredStateType := linearStateTypeForRequestStatus(request.Status)
+	if desiredStateType != "" {
+		var states []linear.WorkflowState
+		if err := callLinear(func(token string) error {
+			fetchedStates, err := a.linearClient.ListTeamStates(ctx, token, *policy.LinearTeamID)
+			if err != nil {
+				return err
+			}
+			states = fetchedStates
+			return nil
+		}); err != nil {
+			if linear.IsAuthError(err) || strings.Contains(strings.ToLower(err.Error()), "linear auth required") {
+				return fmt.Errorf("linear auth required: reconnect Linear in Admin Console")
+			}
+			a.logger.Printf("tracker link: list team states failed request_id=%s: %v", request.ID, err)
+		} else if selectedStateID := pickLinearStateID(states, desiredStateType); selectedStateID != "" {
+			stateID = &selectedStateID
+		}
+	}
+
+	descriptionLines := []string{
+		request.BodyText,
+		"",
+		"*TriageGuard metadata*",
+		fmt.Sprintf("- Status: %s", db.DerivedStatus(request)),
+		fmt.Sprintf("- Priority: %s", request.Priority),
+		fmt.Sprintf("- Type: %s", request.RequestType),
+		fmt.Sprintf("- Assignee (Slack): %s", ownerDisplay),
+		fmt.Sprintf("- Due date: %s", dueDisplay),
+	}
+	if threadURL != "" {
+		descriptionLines = append(descriptionLines, "- Slack thread: "+threadURL)
+	}
+
+	var issue linear.CreatedIssue
+	if err := callLinear(func(token string) error {
+		createdIssue, err := a.linearClient.CreateIssue(ctx, token, linear.CreateIssueInput{
+			TeamID:      *policy.LinearTeamID,
+			Title:       title,
+			Description: strings.Join(descriptionLines, "\n"),
+			AssigneeID:  assigneeID,
+			DueDate:     dueDateForLinear,
+			StateID:     stateID,
+		})
+		if err != nil {
+			return err
+		}
+		issue = createdIssue
+		return nil
+	}); err != nil {
+		if linear.IsAuthError(err) || strings.Contains(strings.ToLower(err.Error()), "linear auth required") {
+			return fmt.Errorf("linear auth required: reconnect Linear in Admin Console")
+		}
+		a.logger.Printf("tracker link: create issue failed request_id=%s: %v", request.ID, err)
+		return err
+	}
+	if assigneeID != nil || dueDateForLinear != nil || stateID != nil {
+		if err := callLinear(func(token string) error {
+			return a.linearClient.UpdateIssue(ctx, token, linear.UpdateIssueInput{
+				IssueID:     issue.ID,
+				AssigneeID:  assigneeID,
+				DueDate:     dueDateForLinear,
+				StateID:     stateID,
+				SetAssignee: assigneeID != nil,
+				SetDueDate:  dueDateForLinear != nil,
+				SetState:    stateID != nil,
+			})
+		}); err != nil {
+			a.logger.Printf("tracker link: issue update fallback failed request_id=%s issue_id=%s: %v", request.ID, issue.ID, err)
+		}
+	}
+	if err := a.store.UpsertLinearIssue(ctx, db.LinearIssue{RequestID: requestID, IssueID: issue.ID, IssueURL: issue.URL}); err != nil {
+		return err
+	}
+	payloadJSON, _ := json.Marshal(map[string]any{
+		"provider":        "linear",
+		"issue_id":        issue.ID,
+		"issue_url":       issue.URL,
+		"linear_state_id": stateID,
+		"assignee_id":     assigneeID,
+		"due_date":        dueDateForLinear,
+	})
+	_ = a.store.InsertAction(ctx, db.RequestAction{RequestID: requestID, ActorSlackID: slackUserID, ActionType: "TRACKER_LINK", Payload: payloadJSON})
+	if err := a.refreshTriageCard(ctx, install, requestID); err != nil {
+		return err
+	}
+	a.trySyncLinkedLinearIssueFromSlackInChannel(ctx, install, requestID, workspaceID, channelID, slackUserID)
+	return nil
+}
+
 func (a *App) refreshTriageCard(ctx context.Context, install db.SlackInstallation, requestID uuid.UUID) error {
 	req, err := a.store.GetRequestByID(ctx, requestID)
 	if err != nil {
 		return err
 	}
-	policy, err := a.store.GetPolicy(ctx, req.WorkspaceID)
-	if err != nil {
-		return err
+	queueLabel := "No queue"
+	if req.QueueID != nil {
+		if queue, queueErr := a.store.GetQueueByID(ctx, *req.QueueID); queueErr == nil {
+			queueLabel = queue.Name
+		}
 	}
-	linearIssue, _ := a.store.GetLinearIssueByRequest(ctx, req.ID)
-	linearURL := ""
-	if linearIssue.IssueURL != "" {
-		linearURL = linearIssue.IssueURL
+	externalIssues, _ := a.store.ListExternalIssuesByRequest(ctx, req.ID)
+	trackerText := ""
+	if len(externalIssues) > 0 {
+		issue := externalIssues[0]
+		label := strings.ToUpper(issue.Provider)
+		if issue.ExternalKey != nil && strings.TrimSpace(*issue.ExternalKey) != "" {
+			label = *issue.ExternalKey
+		}
+		if issue.ExternalURL != nil && strings.TrimSpace(*issue.ExternalURL) != "" {
+			trackerText = fmt.Sprintf("*Tracker:* <%s|%s>", *issue.ExternalURL, label)
+		} else {
+			trackerText = fmt.Sprintf("*Tracker:* %s", label)
+		}
 	}
-	ackSLA, assignSLA, _, err := a.effectiveSLAForChannel(ctx, req.WorkspaceID, req.ChannelID, policy)
-	if err != nil {
-		return err
-	}
-	blocks := slack.RenderTriageBlocks(req, linearURL, policy.Timezone, ackSLA, assignSLA)
+	clocks, _ := a.store.ListRequestSLAClocks(ctx, req.ID)
+	slaHint := slack.RenderSLAHint(req, clocks, time.Now().UTC())
+	blocks := slack.RenderTriageBlocks(req, queueLabel, trackerText, slaHint)
 	if req.TriageMessageTS == nil || *req.TriageMessageTS == "" {
 		posted, err := a.slackClient.PostMessage(ctx, install.BotToken, req.ChannelID, "TriageGuard Request", req.ThreadTS, blocks)
 		if err != nil {
@@ -884,8 +1290,7 @@ func slackActionDedupKey(payload slackActionPayload) string {
 			action.ActionTS,
 		}, "|")
 	case "view_submission":
-		owner := payload.View.State.Values["owner_block"]["owner_select"].SelectedUser
-		due := payload.View.State.Values["due_block"]["due_picker"].SelectedDate
+		stateJSON, _ := json.Marshal(payload.View.State.Values)
 		raw = strings.Join([]string{
 			"view",
 			payload.Team.ID,
@@ -893,8 +1298,7 @@ func slackActionDedupKey(payload slackActionPayload) string {
 			payload.View.ID,
 			payload.View.CallbackID,
 			payload.View.PrivateMetadata,
-			owner,
-			due,
+			string(stateJSON),
 		}, "|")
 	default:
 		return ""

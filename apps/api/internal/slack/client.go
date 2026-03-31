@@ -43,6 +43,13 @@ type Conversation struct {
 	IsPrivate bool   `json:"is_private"`
 }
 
+type User struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+	RealName    string `json:"real_name"`
+	Email       string `json:"email"`
+}
+
 func (c *Client) PostMessage(ctx context.Context, token, channel, text, threadTS string, blocks any) (PostMessageResponse, error) {
 	payload := map[string]any{
 		"channel": channel,
@@ -239,6 +246,73 @@ func (c *Client) GetUserEmail(ctx context.Context, token, userID string) (string
 		return "", fmt.Errorf("slack users.info: %s", payload.Error)
 	}
 	return strings.TrimSpace(payload.User.Profile.Email), nil
+}
+
+func (c *Client) ListUsers(ctx context.Context, token string) ([]User, error) {
+	cursor := ""
+	all := make([]User, 0)
+	for {
+		query := url.Values{}
+		query.Set("limit", "200")
+		if cursor != "" {
+			query.Set("cursor", cursor)
+		}
+		u := baseURL + "/users.list?" + query.Encode()
+		status, _, body, err := c.doRequestWithRetry(ctx, "users.list", func() (*http.Request, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+			return req, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if status >= http.StatusBadRequest {
+			return nil, fmt.Errorf("slack users.list http %d: %s", status, strings.TrimSpace(string(body)))
+		}
+
+		var payload struct {
+			OK      bool   `json:"ok"`
+			Error   string `json:"error"`
+			Members []struct {
+				ID      string `json:"id"`
+				Deleted bool   `json:"deleted"`
+				IsBot   bool   `json:"is_bot"`
+				Profile struct {
+					DisplayName string `json:"display_name"`
+					RealName    string `json:"real_name"`
+					Email       string `json:"email"`
+				} `json:"profile"`
+			} `json:"members"`
+			ResponseMeta struct {
+				NextCursor string `json:"next_cursor"`
+			} `json:"response_metadata"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			return nil, err
+		}
+		if !payload.OK {
+			return nil, fmt.Errorf("slack users.list: %s", payload.Error)
+		}
+		for _, member := range payload.Members {
+			if member.Deleted || member.IsBot || strings.TrimSpace(member.ID) == "" {
+				continue
+			}
+			all = append(all, User{
+				ID:          member.ID,
+				DisplayName: strings.TrimSpace(member.Profile.DisplayName),
+				RealName:    strings.TrimSpace(member.Profile.RealName),
+				Email:       strings.TrimSpace(member.Profile.Email),
+			})
+		}
+		cursor = strings.TrimSpace(payload.ResponseMeta.NextCursor)
+		if cursor == "" {
+			break
+		}
+	}
+	return all, nil
 }
 
 func (c *Client) GetUserDisplayName(ctx context.Context, token, userID string) (string, error) {

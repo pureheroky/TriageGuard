@@ -9,7 +9,7 @@ export function Footer() {
         <div className="mx-auto flex max-w-7xl flex-col items-center gap-6 px-6 py-16 text-center sm:flex-row sm:justify-between sm:text-left">
           <div className="flex flex-col gap-2">
             <h3 className="text-xl font-semibold text-background">Ready to stop losing requests?</h3>
-            <p className="text-sm text-background/60">Start your subscription, connect Slack, and go live in minutes.</p>
+            <p className="text-sm text-background/60">Start your subscription, connect Slack, and see queue health in minutes.</p>
           </div>
           <a href="/login?next=%2Fbilling">
             <Button size="lg" className="h-12 rounded-xl bg-background px-6 text-sm font-semibold text-foreground hover:bg-background/90">
@@ -30,7 +30,7 @@ export function Footer() {
               <span className="text-base font-semibold tracking-tight text-background">TriageGuard</span>
             </a>
             <p className="max-w-xs text-sm leading-relaxed text-background/50">
-              Turn Slack messages into trackable requests with ownership, priority, and SLA timers.
+              Keep internal requests from getting lost with queue health, ownership, SLA risk, and waiting vs forgotten visibility.
             </p>
           </div>
           <div className="space-y-3">

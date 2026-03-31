@@ -4,12 +4,12 @@ import { CheckCircle2, User } from "lucide-react";
 const useCases = [
   {
     title: "Support & customer requests",
-    description: "Keep customer-facing channels organized with explicit ownership and priority tracking.",
+    description: "Keep customer-facing queues healthy with explicit ownership, ack visibility, and queue-level manager control.",
     bullets: [
-      "Turn incoming support messages into tracked requests",
-      "Set owner, priority, and due date directly in thread",
-      "Escalate overdue requests based on SLA policy",
-      "Keep managers aligned with daily digest summaries",
+      "See unacked and unassigned support work immediately",
+      "Set owner, type, priority, and due date directly in thread",
+      "Separate waiting work from forgotten work",
+      "Keep managers aligned with queue health digests",
     ],
     mockSender: "Alex T.",
     mockInitials: "AT",
@@ -20,12 +20,12 @@ const useCases = [
   },
   {
     title: "Bugs & ops incidents",
-    description: "Surface critical incidents from alerts channels and assign them before they snowball.",
+    description: "Surface incidents from Slack and keep the queue under control before response debt piles up.",
     bullets: [
-      "Turn incident reports into tracked requests",
+      "Highlight at-risk and breached work before it gets buried",
       "Assign owner and priority directly in the thread",
-      "Convert to Linear with metadata and thread link",
-      "Use stale reminders to keep unresolved work visible",
+      "Link tracker work only when execution needs it",
+      "Use stale and inactivity signals to keep unresolved work visible",
     ],
     mockSender: "PagerBot",
     mockInitials: "PB",
@@ -97,9 +97,7 @@ export function UseCases() {
       <div className="mx-auto max-w-7xl px-6">
         <div className="mx-auto mb-16 max-w-2xl text-center">
           <p className="mb-3 text-sm font-semibold uppercase tracking-widest text-primary">Use cases</p>
-          <h2 className="text-balance text-3xl font-bold tracking-tight text-foreground sm:text-4xl">
-            Built for the way your team already works
-          </h2>
+          <h2 className="text-balance text-3xl font-bold tracking-tight text-foreground sm:text-4xl">Built for the work your team already runs in Slack</h2>
         </div>
 
         <div className="grid gap-6 lg:grid-cols-2">

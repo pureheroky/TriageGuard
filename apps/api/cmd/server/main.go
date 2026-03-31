@@ -72,10 +72,12 @@ func main() {
 	}
 
 	slaRunner := jobs.NewSLARunner(cfg, app.Store(), app.SlackClient(), app.LinearClient())
+	outboxDispatcher := jobs.NewNotificationDispatcher(cfg, app.Store(), app.SlackClient(), app.LinearClient())
 	retentionRunner := jobs.NewRetentionRunner(cfg, app.Store())
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	go slaRunner.Run(ctx, time.Minute)
+	go outboxDispatcher.Run(ctx, 15*time.Second)
 	go retentionRunner.Run(ctx, time.Duration(cfg.RetentionIntervalMinutes)*time.Minute)
 
 	go func() {

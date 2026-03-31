@@ -10,20 +10,20 @@ const steps = [
   {
     step: "02",
     icon: Hash,
-    title: "Select channels",
-    description: "Enable monitored public or private channels. New root messages become requests automatically.",
+    title: "Pick channels and queue",
+    description: "Choose the Slack channels that feed your first queue so intake lands in a controlled backlog immediately.",
   },
   {
     step: "03",
     icon: Zap,
-    title: "Triage in thread",
-    description: "Use the card to acknowledge, assign owner, set priority, due date, resolve/reopen, or ignore noise.",
+    title: "Triage in one screen",
+    description: "Use the Slack card to ack, assign owner, set type, due date, waiting or snooze state, and resolve from the thread.",
   },
   {
     step: "04",
     icon: ArrowRight,
-    title: "Enforce SLA & optional Linear",
-    description: "Ack/Assign/Stale reminders and daily digest run by policy. Linked Linear issues sync status, assignee, and due date.",
+    title: "Watch queue health",
+    description: "Track unacked, unassigned, at-risk, waiting, and forgotten work with SLA clocks, digests, and optional tracker sync.",
   },
 ];
 
@@ -34,7 +34,7 @@ export function HowItWorks() {
         <div className="mx-auto mb-16 max-w-2xl text-center">
           <p className="mb-3 text-sm font-semibold uppercase tracking-widest text-primary">How it works</p>
           <h2 className="text-balance text-3xl font-bold tracking-tight text-foreground sm:text-4xl">
-            From onboarding to Slack triage in minutes
+            First queue health signal in about 10 minutes
           </h2>
         </div>
 

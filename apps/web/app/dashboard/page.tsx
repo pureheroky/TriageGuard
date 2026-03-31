@@ -1,77 +1,94 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { AlertTriangle, Briefcase, CheckCircle2, Clock3, Download, FileText, Inbox, UserX } from "lucide-react";
+import Link from "next/link";
+import { useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { AlertTriangle, Clock3, Download, FileText, Inbox, PauseCircle, ShieldAlert, UserX } from "lucide-react";
 import { apiFetch } from "@/lib/api";
 import { AdminShell } from "@/components/admin-shell";
 import { RequireAuth } from "@/app/components/require-auth";
-import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Skeleton } from "@/components/ui/skeleton";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Skeleton } from "@/components/ui/skeleton";
 
-type Summary = {
-  new_count: number;
+type DashboardSummary = {
+  open_count: number;
+  unacked_count: number;
   unassigned_count: number;
-  overdue_count: number;
-  assigned_count?: number;
-  open_count?: number;
+  waiting_count: number;
+  breached_count: number;
+  at_risk_count: number;
+  waiting_debt_count: number;
+  no_human_activity_count: number;
+  median_ack_minutes?: number;
+  median_assign_minutes?: number;
+  median_close_minutes?: number;
 };
 
-type OverdueRow = {
-  id: string;
-  status: string;
-  priority: string;
-  title?: string;
-  channel_id: string;
-  thread_ts: string;
-  thread_url?: string;
+type QueueSummaryRow = {
+  queue: {
+    id: string;
+    name: string;
+    is_default: boolean;
+  };
+  open_count: number;
+  unacked_count: number;
+  unassigned_count: number;
+  waiting_count: number;
+  breached_count: number;
+  breached_stale_count: number;
+  at_risk_count: number;
+  waiting_debt_count: number;
+  no_human_activity_count: number;
+  median_ack_minutes?: number;
+  median_assign_minutes?: number;
+  median_close_minutes?: number;
 };
 
-type DurationMetric = {
-  avg_minutes: number;
-  sample_size: number;
+type QueueAgingRow = {
+  queue_id: string;
+  queue_name: string;
+  open_count: number;
+  avg_open_age_hours: number;
+  max_open_age_hours: number;
 };
 
-type TrendPoint = {
-  date: string;
-  ack_avg_minutes?: number;
-  ack_sample_size: number;
-  resolve_avg_minutes?: number;
-  resolve_sample_size: number;
+type TypeSummaryRow = {
+  request_type: string;
+  open_count: number;
+  waiting_count: number;
+  unassigned_count: number;
+  breached_count: number;
+  no_human_activity_count: number;
+  median_ack_minutes?: number;
+  median_assign_minutes?: number;
+  median_close_minutes?: number;
 };
 
-type Analytics = {
-  window_days: number;
-  ack: DurationMetric;
-  resolve: DurationMetric;
-  trend: TrendPoint[];
+type DashboardResponse = {
+  summary: DashboardSummary;
+  queues: QueueSummaryRow[];
+  top_breached_queues: QueueSummaryRow[];
+  top_stale_queues: QueueSummaryRow[];
+  aging_by_queue: QueueAgingRow[];
+  aging_by_type: TypeSummaryRow[];
+  waiting_debt: QueueSummaryRow[];
+  unassigned_debt: QueueSummaryRow[];
+  no_human_activity: QueueSummaryRow[];
 };
 
 type MeResponse = {
   billing?: {
     effective_plan?: string;
     status?: string;
+    entitlements?: {
+      exports?: boolean;
+    };
   };
 };
 
-function isPaidActive(status?: string): boolean {
-  return ["active", "trialing", "past_due", "unpaid", "incomplete"].includes((status || "").toLowerCase());
-}
-
-function formatAvgMinutes(metric: DurationMetric): string {
-  if (metric.sample_size === 0) {
-    return "—";
-  }
-  if (metric.avg_minutes >= 60) {
-    return `${(metric.avg_minutes / 60).toFixed(1)}h`;
-  }
-  return `${metric.avg_minutes.toFixed(1)}m`;
-}
-
-function formatTrendMinutes(value?: number): string {
+function formatMinutes(value?: number): string {
   if (value == null) {
     return "—";
   }
@@ -81,384 +98,49 @@ function formatTrendMinutes(value?: number): string {
   return `${value.toFixed(1)}m`;
 }
 
-function niceChartMax(value: number): number {
-  if (value <= 1) {
-    return 1;
-  }
-
-  const magnitude = Math.pow(10, Math.floor(Math.log10(value)));
-  const normalized = value / magnitude;
-
-  if (normalized <= 1) {
-    return magnitude;
-  }
-  if (normalized <= 2) {
-    return 2 * magnitude;
-  }
-  if (normalized <= 5) {
-    return 5 * magnitude;
-  }
-  return 10 * magnitude;
-}
-
-function TrendChart({ trend }: { trend: TrendPoint[] }) {
-  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
-
-  const chart = useMemo(() => {
-    const width = 860;
-    const height = 300;
-    const padding = { top: 18, right: 22, bottom: 40, left: 56 };
-    const innerWidth = width - padding.left - padding.right;
-    const innerHeight = height - padding.top - padding.bottom;
-    const columnWidth = trend.length > 0 ? innerWidth / trend.length : innerWidth;
-
-    const points = trend.map((entry, idx) => ({
-      idx,
-      x: padding.left + columnWidth * (idx + 0.5),
-      ack: entry.ack_avg_minutes,
-      ackSample: entry.ack_sample_size,
-      resolve: entry.resolve_avg_minutes,
-      resolveSample: entry.resolve_sample_size,
-      date: entry.date,
-    }));
-
-    const maxY = niceChartMax(
-      Math.max(
-        1,
-        ...points.map((point) => point.ack ?? 0),
-        ...points.map((point) => point.resolve ?? 0),
-      ),
-    );
-
-    const yTicks = 5;
-    const yTickValues = Array.from({ length: yTicks }, (_, idx) => {
-      const step = maxY / (yTicks - 1);
-      return maxY - idx * step;
-    });
-
-    const toY = (value?: number) => {
-      if (value == null) {
-        return null;
-      }
-      return padding.top + (1 - value / maxY) * innerHeight;
-    };
-
-    const linePath = (series: "ack" | "resolve") => {
-      let started = false;
-      let d = "";
-      for (const point of points) {
-        const y = toY(point[series]);
-        if (y == null) {
-          continue;
-        }
-        if (!started) {
-          d += `M ${point.x.toFixed(2)} ${y.toFixed(2)} `;
-          started = true;
-        } else {
-          d += `L ${point.x.toFixed(2)} ${y.toFixed(2)} `;
-        }
-      }
-      return d.trim();
-    };
-
-    const areaPath = (series: "ack" | "resolve") => {
-      const seriesPoints = points
-        .map((point) => {
-          const y = toY(point[series]);
-          if (y == null) {
-            return null;
-          }
-          return { x: point.x, y };
-        })
-        .filter((point): point is { x: number; y: number } => point != null);
-
-      if (seriesPoints.length < 2) {
-        return "";
-      }
-
-      const baseline = padding.top + innerHeight;
-      let d = `M ${seriesPoints[0].x.toFixed(2)} ${baseline.toFixed(2)} `;
-      for (const point of seriesPoints) {
-        d += `L ${point.x.toFixed(2)} ${point.y.toFixed(2)} `;
-      }
-      d += `L ${seriesPoints[seriesPoints.length - 1].x.toFixed(2)} ${baseline.toFixed(2)} Z`;
-      return d.trim();
-    };
-
-    const hoverBands = points.map((point, idx) => {
-      return {
-        idx: point.idx,
-        xStart: padding.left + columnWidth * idx,
-        xEnd: padding.left + columnWidth * (idx + 1),
-      };
-    });
-
-    let defaultIndex: number | null = null;
-    for (let idx = points.length - 1; idx >= 0; idx -= 1) {
-      const point = points[idx];
-      if (point.ack != null || point.resolve != null) {
-        defaultIndex = idx;
-        break;
-      }
-    }
-
-    return {
-      width,
-      height,
-      padding,
-      innerHeight,
-      points,
-      yTickValues,
-      toY,
-      ackPath: linePath("ack"),
-      resolvePath: linePath("resolve"),
-      ackAreaPath: areaPath("ack"),
-      resolveAreaPath: areaPath("resolve"),
-      hoverBands,
-      defaultIndex,
-    };
-  }, [trend]);
-
-  const hasData = trend.some((point) => point.ack_sample_size > 0 || point.resolve_sample_size > 0);
-  if (!hasData) {
-    return <p className="text-sm text-muted-foreground">No analytics data for selected window yet.</p>;
-  }
-
-  const selectedIndex = hoveredIndex ?? chart.defaultIndex;
-  const selectedPoint = selectedIndex != null ? chart.points[selectedIndex] : null;
-  const xLabelStep = Math.max(1, Math.ceil(chart.points.length / 6));
-
+function MetricCard({
+  title,
+  value,
+  icon: Icon,
+}: {
+  title: string;
+  value: string | number;
+  icon: typeof Inbox;
+}) {
   return (
-    <div className="space-y-3">
-      <div className="w-full overflow-x-auto rounded-lg border border-border/50 bg-muted/20 p-3">
-        <svg
-          viewBox={`0 0 ${chart.width} ${chart.height}`}
-          className="h-[280px] w-full min-w-[760px]"
-          onMouseLeave={() => setHoveredIndex(null)}
-        >
-          {chart.yTickValues.map((tickValue, idx) => {
-            const y = chart.toY(tickValue);
-            if (y == null) {
-              return null;
-            }
-            const isZero = Math.abs(tickValue) < 0.0001;
-            return (
-              <g key={`y-${idx}`}>
-                <line
-                  x1={chart.padding.left}
-                  y1={y}
-                  x2={chart.width - chart.padding.right}
-                  y2={y}
-                  stroke="hsl(var(--border))"
-                  strokeWidth={isZero ? 1.5 : 1}
-                  strokeDasharray={isZero ? "0" : "4 4"}
-                />
-                <text x={10} y={y + 3} className="fill-muted-foreground text-[10px]">
-                  {formatTrendMinutes(tickValue).replace(".0", "")}
-                </text>
-              </g>
-            );
-          })}
-
-          <line
-            x1={chart.padding.left}
-            y1={chart.padding.top}
-            x2={chart.padding.left}
-            y2={chart.height - chart.padding.bottom}
-            stroke="hsl(var(--border))"
-            strokeWidth="1"
-          />
-
-          {chart.hoverBands.map((band) => (
-            <rect
-              key={`hover-${band.idx}`}
-              x={band.xStart}
-              y={chart.padding.top}
-              width={Math.max(1, band.xEnd - band.xStart)}
-              height={chart.innerHeight}
-              fill="transparent"
-              onMouseEnter={() => setHoveredIndex(band.idx)}
-            />
-          ))}
-
-          {selectedPoint && (
-            (() => {
-              const band = chart.hoverBands.find((item) => item.idx === selectedPoint.idx);
-              if (!band) {
-                return null;
-              }
-              return (
-                <rect
-                  x={band.xStart}
-                  y={chart.padding.top}
-                  width={Math.max(1, band.xEnd - band.xStart)}
-                  height={chart.innerHeight}
-                  fill="hsl(var(--muted))"
-                  opacity="0.35"
-                />
-              );
-            })()
-          )}
-
-          {chart.ackAreaPath && (
-            <path d={chart.ackAreaPath} fill="var(--color-chart-1)" opacity="0.12" stroke="none" />
-          )}
-          {chart.resolveAreaPath && (
-            <path d={chart.resolveAreaPath} fill="var(--color-chart-2)" opacity="0.1" stroke="none" />
-          )}
-
-          {chart.ackPath && (
-            <path
-              d={chart.ackPath}
-              fill="none"
-              stroke="var(--color-chart-1)"
-              strokeWidth="3.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          )}
-          {chart.resolvePath && (
-            <path
-              d={chart.resolvePath}
-              fill="none"
-              stroke="var(--color-chart-2)"
-              strokeWidth="3.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeDasharray="8 6"
-            />
-          )}
-
-          {chart.points.map((point) => {
-            const ackY = chart.toY(point.ack);
-            const resolveY = chart.toY(point.resolve);
-            const isSelected = selectedPoint?.idx === point.idx;
-            return (
-              <g key={point.date}>
-                {ackY != null && (
-                  <circle
-                    cx={point.x}
-                    cy={ackY}
-                    r={isSelected ? 4.5 : 3}
-                    fill="var(--color-chart-1)"
-                    stroke="hsl(var(--background))"
-                    strokeWidth="1.5"
-                  />
-                )}
-                {resolveY != null && (
-                  <circle
-                    cx={point.x}
-                    cy={resolveY}
-                    r={isSelected ? 4.5 : 3}
-                    fill="var(--color-chart-2)"
-                    stroke="hsl(var(--background))"
-                    strokeWidth="1.5"
-                  />
-                )}
-              </g>
-            );
-          })}
-
-          {chart.points.map((point, idx) => {
-            if (idx % xLabelStep !== 0 && idx !== chart.points.length - 1) {
-              return null;
-            }
-            return (
-              <text
-                key={`label-${point.date}`}
-                x={point.x}
-                y={chart.height - 10}
-                textAnchor="middle"
-                className="fill-muted-foreground text-[10px]"
-              >
-                {point.date.slice(5)}
-              </text>
-            );
-          })}
-        </svg>
-      </div>
-
-      {selectedPoint && (
-        <div className="grid gap-2 sm:grid-cols-3">
-          <div className="rounded-md border border-border/60 bg-card px-3 py-2">
-            <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Date</p>
-            <p className="text-sm font-medium text-foreground">{selectedPoint.date}</p>
-          </div>
-          <div className="rounded-md border border-border/60 bg-card px-3 py-2">
-            <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Ack avg</p>
-            <p className="text-sm font-medium text-foreground">{formatTrendMinutes(selectedPoint.ack)}</p>
-            <p className="text-[11px] text-muted-foreground">{selectedPoint.ackSample} samples</p>
-          </div>
-          <div className="rounded-md border border-border/60 bg-card px-3 py-2">
-            <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Resolve avg</p>
-            <p className="text-sm font-medium text-foreground">{formatTrendMinutes(selectedPoint.resolve)}</p>
-            <p className="text-[11px] text-muted-foreground">{selectedPoint.resolveSample} samples</p>
-          </div>
+    <Card className="border-border/60 shadow-sm">
+      <CardContent className="flex items-center gap-4 p-5">
+        <div className="flex size-12 items-center justify-center rounded-xl bg-primary/10">
+          <Icon className="size-5 text-primary" />
         </div>
-      )}
-    </div>
+        <div>
+          <p className="text-xs text-muted-foreground">{title}</p>
+          <p className="text-2xl font-bold tabular-nums">{value}</p>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
 function DashboardSkeleton() {
   return (
-    <div className="mx-auto max-w-6xl space-y-6">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="space-y-2">
-          <Skeleton className="h-8 w-44" />
-          <Skeleton className="h-4 w-72" />
-        </div>
-        <Skeleton className="h-10 w-56" />
+    <div className="mx-auto max-w-7xl space-y-6">
+      <div className="space-y-2">
+        <Skeleton className="h-8 w-44" />
+        <Skeleton className="h-4 w-72" />
       </div>
-
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        {Array.from({ length: 4 }).map((_, idx) => (
-          <Card key={`kpi-${idx}`} className="border-border/60 shadow-sm">
-            <CardContent className="flex items-center gap-4 p-5">
-              <Skeleton className="size-12 rounded-xl" />
-              <div className="space-y-2">
-                <Skeleton className="h-3 w-24" />
-                <Skeleton className="h-7 w-12" />
-              </div>
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        {Array.from({ length: 6 }).map((_, idx) => (
+          <Card key={idx} className="border-border/60 shadow-sm">
+            <CardContent className="p-5">
+              <Skeleton className="h-16 w-full" />
             </CardContent>
           </Card>
         ))}
       </div>
-
-      <div className="grid gap-4 lg:grid-cols-2">
-        {Array.from({ length: 2 }).map((_, idx) => (
-          <Card key={`metric-${idx}`} className="border-border/60 shadow-sm">
-            <CardContent className="flex items-center gap-4 p-5">
-              <Skeleton className="size-12 rounded-xl" />
-              <div className="space-y-2">
-                <Skeleton className="h-3 w-36" />
-                <Skeleton className="h-7 w-20" />
-                <Skeleton className="h-3 w-40" />
-              </div>
-            </CardContent>
-          </Card>
-        ))}
-      </div>
-
       <Card className="border-border/60 shadow-sm">
-        <CardHeader className="space-y-2">
-          <Skeleton className="h-5 w-56" />
-          <Skeleton className="h-3 w-72" />
-        </CardHeader>
-        <CardContent>
-          <Skeleton className="h-[320px] w-full rounded-xl" />
-        </CardContent>
-      </Card>
-
-      <Card className="border-border/60 shadow-sm">
-        <CardHeader className="space-y-2">
-          <Skeleton className="h-5 w-44" />
-          <Skeleton className="h-3 w-60" />
-        </CardHeader>
-        <CardContent className="space-y-3">
-          {Array.from({ length: 4 }).map((_, idx) => (
-            <Skeleton key={`row-${idx}`} className="h-11 w-full rounded-lg" />
-          ))}
+        <CardContent className="p-5">
+          <Skeleton className="h-64 w-full" />
         </CardContent>
       </Card>
     </div>
@@ -467,84 +149,83 @@ function DashboardSkeleton() {
 
 export default function DashboardPage() {
   const [windowDays, setWindowDays] = useState<7 | 30 | 90>(30);
+  const queryClient = useQueryClient();
   const meQuery = useQuery({
     queryKey: ["me"],
     queryFn: () => apiFetch<MeResponse>("/api/me"),
   });
-  const isEnterprise =
-    meQuery.data?.billing?.effective_plan === "enterprise" && isPaidActive(meQuery.data?.billing?.status);
-
+  const sampleSeedMutation = useMutation({
+    mutationFn: () => apiFetch<{ ok: boolean }>("/api/onboarding/sample-data", { method: "POST" }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["queue-dashboard"] });
+      queryClient.invalidateQueries({ queryKey: ["requests-summary"] });
+      queryClient.invalidateQueries({ queryKey: ["queues"] });
+    },
+  });
   const query = useQuery({
-    queryKey: ["requests-summary", windowDays],
-    queryFn: () =>
-      apiFetch<{ summary: Summary; overdue: OverdueRow[]; analytics: Analytics }>(
-        `/api/requests/summary?days=${windowDays}`,
-      ),
+    queryKey: ["queue-dashboard"],
+    queryFn: () => apiFetch<DashboardResponse>("/api/requests/summary"),
     refetchInterval: 10_000,
     refetchIntervalInBackground: true,
-    refetchOnWindowFocus: true,
   });
 
+  if (query.isLoading || meQuery.isLoading) {
+    return (
+      <RequireAuth>
+        <AdminShell>
+          <DashboardSkeleton />
+        </AdminShell>
+      </RequireAuth>
+    );
+  }
+
   const summary = query.data?.summary;
-  const overdue = query.data?.overdue ?? [];
-  const analytics = query.data?.analytics;
-  const isLoadingInitial = query.isLoading || meQuery.isLoading;
+  const queues = query.data?.queues ?? [];
+  const topBreachedQueues = query.data?.top_breached_queues ?? [];
+  const topStaleQueues = query.data?.top_stale_queues ?? [];
+  const agingByQueue = query.data?.aging_by_queue ?? [];
+  const agingByType = query.data?.aging_by_type ?? [];
+  const waitingDebt = query.data?.waiting_debt ?? [];
+  const unassignedDebt = query.data?.unassigned_debt ?? [];
+  const noHumanActivity = query.data?.no_human_activity ?? [];
+  const canExport = Boolean(meQuery.data?.billing?.entitlements?.exports);
 
   return (
     <RequireAuth>
       <AdminShell>
-        {isLoadingInitial ? <DashboardSkeleton /> : <div className="mx-auto max-w-6xl space-y-6">
+        <div className="mx-auto max-w-7xl space-y-6">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
-              <h1 className="text-2xl font-bold tracking-tight text-foreground">Dashboard</h1>
-              <p className="mt-1 text-sm text-muted-foreground">Overview of your workspace triage health.</p>
+              <h1 className="text-2xl font-bold tracking-tight text-foreground">Queue Health</h1>
+              <p className="mt-1 text-sm text-muted-foreground">
+                See what is unacked, unassigned, at risk, waiting, or simply forgotten before it turns into process debt.
+              </p>
             </div>
             <div className="flex items-center gap-2">
-              {isEnterprise ? (
+              {(summary?.open_count ?? 0) === 0 ? (
+                <Button size="sm" variant="outline" className="h-8 px-3 text-xs" onClick={() => sampleSeedMutation.mutate()} disabled={sampleSeedMutation.isPending}>
+                  {sampleSeedMutation.isPending ? "Loading sample..." : "Load sample data"}
+                </Button>
+              ) : null}
+              {canExport ? (
                 <>
                   <Button
                     size="sm"
                     variant="outline"
                     className="h-8 gap-1.5 px-3 text-xs"
-                    onClick={() => {
-                      window.open(`/api/backend/api/reports/requests.csv?days=${windowDays}`, "_blank", "noopener,noreferrer");
-                    }}
+                    onClick={() => window.open(`/api/backend/api/reports/requests.csv?days=${windowDays}`, "_blank", "noopener,noreferrer")}
                   >
                     <Download className="size-3.5" />
-                    Export requests CSV
+                    Requests CSV
                   </Button>
                   <Button
                     size="sm"
                     variant="outline"
                     className="h-8 gap-1.5 px-3 text-xs"
-                    onClick={() => {
-                      window.open(`/api/backend/api/reports/requests.pdf?days=${windowDays}`, "_blank", "noopener,noreferrer");
-                    }}
+                    onClick={() => window.open(`/api/backend/api/reports/requests.pdf?days=${windowDays}`, "_blank", "noopener,noreferrer")}
                   >
                     <FileText className="size-3.5" />
-                    Export requests PDF
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="h-8 gap-1.5 px-3 text-xs"
-                    onClick={() => {
-                      window.open(`/api/backend/api/reports/analytics.csv?days=${windowDays}`, "_blank", "noopener,noreferrer");
-                    }}
-                  >
-                    <Download className="size-3.5" />
-                    Export analytics CSV
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="h-8 gap-1.5 px-3 text-xs"
-                    onClick={() => {
-                      window.open(`/api/backend/api/reports/analytics.pdf?days=${windowDays}`, "_blank", "noopener,noreferrer");
-                    }}
-                  >
-                    <FileText className="size-3.5" />
-                    Export analytics PDF
+                    Requests PDF
                   </Button>
                 </>
               ) : null}
@@ -565,170 +246,197 @@ export default function DashboardPage() {
             </div>
           </div>
 
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            <Card className="border-border/60 shadow-sm">
-              <CardContent className="flex items-center gap-4 p-5">
-                <div className="flex size-12 items-center justify-center rounded-xl bg-primary/10">
-                  <Inbox className="size-5 text-primary" />
-                </div>
-                <div>
-                  <p className="text-xs text-muted-foreground">New requests</p>
-                  <p className="text-2xl font-bold tabular-nums">{summary?.new_count ?? 0}</p>
-                </div>
-              </CardContent>
-            </Card>
-            <Card className="border-border/60 shadow-sm">
-              <CardContent className="flex items-center gap-4 p-5">
-                <div className="flex size-12 items-center justify-center rounded-xl bg-warning/10">
-                  <UserX className="size-5 text-warning-foreground" />
-                </div>
-                <div>
-                  <p className="text-xs text-muted-foreground">Unassigned</p>
-                  <p className="text-2xl font-bold tabular-nums">{summary?.unassigned_count ?? 0}</p>
-                </div>
-              </CardContent>
-            </Card>
-            <Card className="border-border/60 shadow-sm">
-              <CardContent className="flex items-center gap-4 p-5">
-                <div className="flex size-12 items-center justify-center rounded-xl bg-success/10">
-                  <Briefcase className="size-5 text-success" />
-                </div>
-                <div>
-                  <p className="text-xs text-muted-foreground">Assigned</p>
-                  <p className="text-2xl font-bold tabular-nums">{summary?.assigned_count ?? 0}</p>
-                </div>
-              </CardContent>
-            </Card>
-            <Card className="border-border/60 shadow-sm">
-              <CardContent className="flex items-center gap-4 p-5">
-                <div className="flex size-12 items-center justify-center rounded-xl bg-destructive/10">
-                  <AlertTriangle className="size-5 text-destructive" />
-                </div>
-                <div>
-                  <p className="text-xs text-muted-foreground">Overdue</p>
-                  <p className="text-2xl font-bold tabular-nums">{summary?.overdue_count ?? 0}</p>
-                </div>
-              </CardContent>
-            </Card>
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            <MetricCard title="Open requests" value={summary?.open_count ?? 0} icon={Inbox} />
+            <MetricCard title="Unacked" value={summary?.unacked_count ?? 0} icon={ShieldAlert} />
+            <MetricCard title="Unassigned" value={summary?.unassigned_count ?? 0} icon={UserX} />
+            <MetricCard title="Waiting / snoozed" value={summary?.waiting_count ?? 0} icon={PauseCircle} />
+            <MetricCard title="Breached" value={summary?.breached_count ?? 0} icon={AlertTriangle} />
+            <MetricCard title="At risk" value={summary?.at_risk_count ?? 0} icon={Clock3} />
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            <MetricCard title="Waiting debt" value={summary?.waiting_debt_count ?? 0} icon={PauseCircle} />
+            <MetricCard title="No human activity" value={summary?.no_human_activity_count ?? 0} icon={Clock3} />
+            <MetricCard title="Median ack" value={formatMinutes(summary?.median_ack_minutes)} icon={Clock3} />
           </div>
 
           <div className="grid gap-4 lg:grid-cols-2">
-            <Card className="border-border/60 shadow-sm">
-              <CardContent className="flex items-center gap-4 p-5">
-                <div className="flex size-12 items-center justify-center rounded-xl bg-primary/10">
-                  <Clock3 className="size-5 text-primary" />
-                </div>
-                <div>
-                  <p className="text-xs text-muted-foreground">Average time to ack</p>
-                  <p className="text-2xl font-bold tabular-nums">{analytics ? formatAvgMinutes(analytics.ack) : "—"}</p>
-                  <p className="text-xs text-muted-foreground">
-                    {analytics?.ack.sample_size ?? 0} samples in {analytics?.window_days ?? windowDays}d
-                  </p>
-                </div>
-              </CardContent>
-            </Card>
-
-            <Card className="border-border/60 shadow-sm">
-              <CardContent className="flex items-center gap-4 p-5">
-                <div className="flex size-12 items-center justify-center rounded-xl bg-success/10">
-                  <CheckCircle2 className="size-5 text-success" />
-                </div>
-                <div>
-                  <p className="text-xs text-muted-foreground">Average time to resolve</p>
-                  <p className="text-2xl font-bold tabular-nums">
-                    {analytics ? formatAvgMinutes(analytics.resolve) : "—"}
-                  </p>
-                  <p className="text-xs text-muted-foreground">
-                    {analytics?.resolve.sample_size ?? 0} samples in {analytics?.window_days ?? windowDays}d
-                  </p>
-                </div>
-              </CardContent>
-            </Card>
+            <MetricCard title="Median assign" value={formatMinutes(summary?.median_assign_minutes)} icon={Clock3} />
+            <MetricCard title="Median close" value={formatMinutes(summary?.median_close_minutes)} icon={Clock3} />
           </div>
 
           <Card className="border-border/60 shadow-sm">
-            <CardHeader className="pb-2">
-              <CardTitle className="text-base font-semibold">SLA trend: Ack vs Resolve</CardTitle>
-              <CardDescription className="text-xs">
-                Daily averages for selected window ({analytics?.window_days ?? windowDays} days).
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <div className="flex items-center gap-4 text-xs text-muted-foreground">
-                <div className="flex items-center gap-2">
-                  <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: "var(--color-chart-1)" }} />
-                  Ack avg
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: "var(--color-chart-2)" }} />
-                  Resolve avg
-                </div>
-              </div>
-              <TrendChart trend={analytics?.trend ?? []} />
-            </CardContent>
-          </Card>
-
-          <Card className="border-border/60 shadow-sm">
-            <CardHeader className="pb-3">
-              <CardTitle className="text-base font-semibold">Top overdue requests</CardTitle>
-              <CardDescription className="text-xs">Requests that have exceeded SLA windows.</CardDescription>
+            <CardHeader>
+              <CardTitle className="text-base font-semibold">Queues</CardTitle>
+              <CardDescription className="text-xs">Ownership, SLA risk, waiting debt, and inactivity in one list.</CardDescription>
             </CardHeader>
             <CardContent className="p-0">
               <Table>
                 <TableHeader>
                   <TableRow className="border-border/40 hover:bg-transparent">
-                    <TableHead className="pl-6 text-xs">Status</TableHead>
-                    <TableHead className="text-xs">Priority</TableHead>
-                    <TableHead className="text-xs">Title</TableHead>
-                    <TableHead className="text-xs">Slack thread</TableHead>
+                    <TableHead className="pl-6 text-xs">Queue</TableHead>
+                    <TableHead className="text-xs">Open</TableHead>
+                    <TableHead className="text-xs">Unacked</TableHead>
+                    <TableHead className="text-xs">Unassigned</TableHead>
+                    <TableHead className="text-xs">Waiting debt</TableHead>
+                    <TableHead className="text-xs">No activity</TableHead>
+                    <TableHead className="text-xs">Breached</TableHead>
+                    <TableHead className="text-xs">At risk</TableHead>
+                    <TableHead className="pr-6 text-xs">Median ack</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {overdue.map((row) => (
-                    <TableRow key={row.id} className="border-border/40">
-                      <TableCell className="pl-6">
-                        <Badge variant="secondary" className="rounded-md px-2 py-0.5 text-[10px] font-semibold">
-                          {row.status}
-                        </Badge>
+                  {queues.map((row) => (
+                    <TableRow key={row.queue.id} className="border-border/40">
+                      <TableCell className="pl-6 text-sm font-medium text-foreground">
+                        <Link href={`/queues/${row.queue.id}`} className="transition-colors hover:text-primary">
+                          {row.queue.name}
+                        </Link>
+                        {row.queue.is_default ? <span className="ml-2 text-xs text-muted-foreground">Default</span> : null}
                       </TableCell>
-                      <TableCell>
-                        <Badge className="rounded-md bg-destructive/10 px-2 py-0.5 text-[10px] font-semibold text-destructive hover:bg-destructive/10">
-                          {row.priority}
-                        </Badge>
-                      </TableCell>
-                      <TableCell className="max-w-sm truncate text-xs text-muted-foreground">
-                        {row.title || "(no title)"}
-                      </TableCell>
-                      <TableCell className="text-xs text-muted-foreground">
-                        {row.thread_url ? (
-                          <a
-                            href={row.thread_url}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="underline underline-offset-2 hover:text-foreground"
-                          >
-                            Open Slack thread
-                          </a>
-                        ) : (
-                          `${row.channel_id} / ${row.thread_ts}`
-                        )}
-                      </TableCell>
+                      <TableCell className="text-xs tabular-nums">{row.open_count}</TableCell>
+                      <TableCell className="text-xs tabular-nums">{row.unacked_count}</TableCell>
+                      <TableCell className="text-xs tabular-nums">{row.unassigned_count}</TableCell>
+                      <TableCell className="text-xs tabular-nums">{row.waiting_debt_count}</TableCell>
+                      <TableCell className="text-xs tabular-nums">{row.no_human_activity_count}</TableCell>
+                      <TableCell className="text-xs tabular-nums">{row.breached_count}</TableCell>
+                      <TableCell className="text-xs tabular-nums">{row.at_risk_count}</TableCell>
+                      <TableCell className="pr-6 text-xs">{formatMinutes(row.median_ack_minutes)}</TableCell>
                     </TableRow>
                   ))}
-                  {overdue.length === 0 && (
+                  {queues.length === 0 ? (
                     <TableRow>
-                      <TableCell colSpan={4} className="py-10 text-center text-sm text-muted-foreground">
-                        No overdue requests.
+                      <TableCell colSpan={9} className="py-10 text-center text-sm text-muted-foreground">
+                        No queues yet. Use onboarding or sample data to see queue health in action.
                       </TableCell>
                     </TableRow>
-                  )}
+                  ) : null}
                 </TableBody>
               </Table>
             </CardContent>
           </Card>
 
-        </div>}
+          <div className="grid gap-6 lg:grid-cols-2">
+            <Card className="border-border/60 shadow-sm">
+              <CardHeader>
+                <CardTitle className="text-base font-semibold">Aging by Queue</CardTitle>
+                <CardDescription className="text-xs">Queues with the oldest average open work bubble to the top.</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                {agingByQueue.slice(0, 5).map((row) => (
+                  <div key={row.queue_id} className="flex items-center justify-between rounded-lg border border-border/50 px-3 py-2">
+                    <div>
+                      <p className="text-sm font-medium text-foreground">{row.queue_name}</p>
+                      <p className="text-xs text-muted-foreground">{row.open_count} open</p>
+                    </div>
+                    <div className="text-right">
+                      <p className="text-sm font-semibold text-foreground">{row.avg_open_age_hours.toFixed(1)}h avg</p>
+                      <p className="text-xs text-muted-foreground">{row.max_open_age_hours.toFixed(1)}h max</p>
+                    </div>
+                  </div>
+                ))}
+                {agingByQueue.length === 0 ? <p className="text-sm text-muted-foreground">No aging data yet.</p> : null}
+              </CardContent>
+            </Card>
+
+            <Card className="border-border/60 shadow-sm">
+              <CardHeader>
+                <CardTitle className="text-base font-semibold">Aging by Type</CardTitle>
+                <CardDescription className="text-xs">Compare request types by load, debt, and response speed.</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                {agingByType.slice(0, 6).map((row) => (
+                  <div key={row.request_type} className="grid grid-cols-2 gap-3 rounded-lg border border-border/50 px-3 py-2 text-sm">
+                    <div>
+                      <p className="font-medium capitalize text-foreground">{row.request_type}</p>
+                      <p className="text-xs text-muted-foreground">
+                        Open {row.open_count} · Waiting {row.waiting_count} · Unassigned {row.unassigned_count}
+                      </p>
+                    </div>
+                    <div className="text-right">
+                      <p className="font-semibold text-foreground">Ack {formatMinutes(row.median_ack_minutes)}</p>
+                      <p className="text-xs text-muted-foreground">Assign {formatMinutes(row.median_assign_minutes)}</p>
+                    </div>
+                  </div>
+                ))}
+                {agingByType.length === 0 ? <p className="text-sm text-muted-foreground">No type-level analytics yet.</p> : null}
+              </CardContent>
+            </Card>
+          </div>
+
+          <div className="grid gap-6 lg:grid-cols-3">
+            <DebtCard title="Waiting Debt" rows={waitingDebt} valueKey="waiting_debt_count" />
+            <DebtCard title="Unassigned Debt" rows={unassignedDebt} valueKey="unassigned_count" />
+            <DebtCard title="No Human Activity" rows={noHumanActivity} valueKey="no_human_activity_count" />
+          </div>
+
+          <div className="grid gap-6 lg:grid-cols-2">
+            <CompactQueueCard title="Top breached queues" rows={topBreachedQueues} valueKey="breached_count" />
+            <CompactQueueCard title="Top stale queues" rows={topStaleQueues} valueKey="breached_stale_count" />
+          </div>
+        </div>
       </AdminShell>
     </RequireAuth>
+  );
+}
+
+function DebtCard({
+  title,
+  rows,
+  valueKey,
+}: {
+  title: string;
+  rows: QueueSummaryRow[];
+  valueKey: "waiting_debt_count" | "unassigned_count" | "no_human_activity_count";
+}) {
+  const nonZeroRows = rows.filter((row) => row[valueKey] > 0).slice(0, 5);
+  return (
+    <Card className="border-border/60 shadow-sm">
+      <CardHeader>
+        <CardTitle className="text-base font-semibold">{title}</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {nonZeroRows.map((row) => (
+          <div key={row.queue.id} className="flex items-center justify-between rounded-lg border border-border/50 px-3 py-2">
+            <p className="text-sm font-medium text-foreground">{row.queue.name}</p>
+            <p className="text-sm font-semibold text-foreground">{row[valueKey]}</p>
+          </div>
+        ))}
+        {nonZeroRows.length === 0 ? <p className="text-sm text-muted-foreground">No current debt.</p> : null}
+      </CardContent>
+    </Card>
+  );
+}
+
+function CompactQueueCard({
+  title,
+  rows,
+  valueKey,
+}: {
+  title: string;
+  rows: QueueSummaryRow[];
+  valueKey: "breached_count" | "breached_stale_count";
+}) {
+  return (
+    <Card className="border-border/60 shadow-sm">
+      <CardHeader>
+        <CardTitle className="text-base font-semibold">{title}</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {rows.map((row) => (
+          <div key={row.queue.id} className="flex items-center justify-between rounded-lg border border-border/50 px-3 py-2">
+            <div>
+              <Link href={`/queues/${row.queue.id}`} className="text-sm font-medium text-foreground transition-colors hover:text-primary">
+                {row.queue.name}
+              </Link>
+              <p className="text-xs text-muted-foreground">{row.open_count} open</p>
+            </div>
+            <span className="text-sm font-semibold text-foreground">{row[valueKey]}</span>
+          </div>
+        ))}
+        {rows.length === 0 ? <p className="text-sm text-muted-foreground">No queues in this view.</p> : null}
+      </CardContent>
+    </Card>
   );
 }

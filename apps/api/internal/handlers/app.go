@@ -131,8 +131,18 @@ func (a *App) Router() http.Handler {
 			sr.Get("/api/channels", a.handleListChannels)
 			sr.Post("/api/channels/sync", a.handleSyncChannels)
 			sr.Put("/api/channels", a.handleUpdateChannels)
+			sr.Get("/api/slack/users", a.handleSlackUsers)
 			sr.Get("/api/channels/overrides", a.handleGetChannelOverrides)
 			sr.Put("/api/channels/overrides", a.handleUpdateChannelOverrides)
+			sr.Get("/api/queues", a.handleListQueues)
+			sr.Put("/api/queues", a.handleUpsertQueues)
+			sr.Get("/api/queues/{queueID}", a.handleGetQueueDetail)
+			sr.Get("/api/queue-routing-rules", a.handleListQueueRoutingRules)
+			sr.Put("/api/queue-routing-rules", a.handleUpsertQueueRoutingRules)
+			sr.Get("/api/escalation-steps", a.handleListEscalationSteps)
+			sr.Put("/api/escalation-steps", a.handleUpsertEscalationSteps)
+			sr.Post("/api/onboarding/sample-data", a.handleSeedSampleData)
+			sr.Delete("/api/onboarding/sample-data", a.handleResetSampleData)
 			sr.Post("/api/slack/disconnect", a.handleDisconnectSlack)
 			sr.Get("/api/policies", a.handleGetPolicies)
 			sr.Put("/api/policies", a.handleUpdatePolicies)
@@ -148,6 +158,16 @@ func (a *App) Router() http.Handler {
 			sr.Get("/api/reports/analytics.pdf", a.handleAnalyticsPDF)
 			sr.Get("/api/activity", a.handleActivity)
 			sr.Get("/api/dead-letters", a.handleListDeadLetters)
+			sr.Get("/api/ops/summary", a.handleWorkspaceOpsSummary)
+			sr.Get("/api/ops/events", a.handleWorkspaceOpsEvents)
+		})
+
+		pr.Group(func(ir chi.Router) {
+			ir.Use(a.requireInternalOperator)
+			ir.Get("/api/internal/ops/summary", a.handleInternalOpsSummary)
+			ir.Get("/api/internal/ops/dead-letters", a.handleInternalDeadLetters)
+			ir.Get("/api/internal/ops/outbox", a.handleInternalOutbox)
+			ir.Get("/api/internal/ops/runners", a.handleInternalRunnerStatus)
 		})
 	})
 
@@ -271,6 +291,41 @@ func (a *App) workspaceHasPaidAccess(ctx context.Context, workspaceID uuid.UUID)
 	status := strings.ToLower(strings.TrimSpace(sub.Status))
 	plan := effectivePlan(sub)
 	return hasPaidWorkspaceAccess(sub), plan, status, nil
+}
+
+func (a *App) workspaceEntitlements(ctx context.Context, workspaceID uuid.UUID) (db.WorkspaceEntitlements, error) {
+	sub, err := a.store.GetWorkspaceSubscriptionOrDefault(ctx, workspaceID)
+	if err != nil {
+		return db.WorkspaceEntitlements{}, err
+	}
+	return entitlementsForPlan(effectivePlan(sub)), nil
+}
+
+func (a *App) isInternalOperatorUser(userID uuid.UUID) bool {
+	if a == nil {
+		return false
+	}
+	for _, raw := range a.cfg.InternalOperatorUserIDs {
+		if strings.EqualFold(strings.TrimSpace(raw), userID.String()) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) requireInternalOperator(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		userID, err := userIDFromContext(r.Context())
+		if err != nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if !a.isInternalOperatorUser(userID) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (a *App) requireActivePaidSubscription() func(http.Handler) http.Handler {

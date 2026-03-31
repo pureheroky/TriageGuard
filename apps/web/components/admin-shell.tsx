@@ -5,7 +5,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import { cn } from "@/lib/utils";
 import type { LucideIcon } from "lucide-react";
-import { LayoutDashboard, Hash, Timer, ArrowRightLeft, CreditCard, Activity, Menu, LogOut, ChevronLeft, Sparkles } from "lucide-react";
+import { LayoutDashboard, Hash, Timer, ArrowRightLeft, CreditCard, Activity, Menu, LogOut, ChevronLeft, Sparkles, ListChecks, ShieldCheck, ServerCog } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { TriageGuardLogo } from "@/components/triageguard-logo";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -24,7 +24,9 @@ const fullNavigation = [
   { name: "Dashboard", href: "/dashboard", icon: LayoutDashboard },
   { name: "Onboarding", href: "/onboarding", icon: Sparkles },
   { name: "Channels", href: "/channels", icon: Hash },
+  { name: "Queues", href: "/queues", icon: ListChecks },
   { name: "SLA Policies", href: "/policies", icon: Timer },
+  { name: "Ops", href: "/ops", icon: ShieldCheck },
   { name: "Linear", href: "/linear", icon: ArrowRightLeft },
   { name: "Billing", href: "/billing", icon: CreditCard },
   { name: "Activity", href: "/activity", icon: Activity },
@@ -107,12 +109,17 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
       apiFetch<{
         integrations?: { slack_connected?: boolean };
         billing?: { effective_plan?: string; status?: string };
+        internal_operator?: boolean;
       }>("/api/me"),
   });
   const billing = meQuery.data?.billing;
   const plan = billing?.effective_plan || "";
   const hasPaidSubscription = (plan === "team" || plan === "enterprise") && isPaidActive(billing?.status || "");
-  const navigation = hasPaidSubscription ? fullNavigation : billingOnlyNavigation;
+  const navigation = hasPaidSubscription
+    ? meQuery.data?.internal_operator
+      ? [...fullNavigation, { name: "Internal Ops", href: "/internal-ops", icon: ServerCog }]
+      : fullNavigation
+    : billingOnlyNavigation;
 
   async function logout() {
     await fetch("/api/auth/logout", {
@@ -172,11 +179,20 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
         billing?: { effective_plan?: string; status?: string };
       }>("/api/me"),
   });
-
   const slackConnected = meQuery.data?.integrations?.slack_connected ?? false;
   const billing = meQuery.data?.billing;
   const plan = billing?.effective_plan || "";
   const hasPaidSubscription = (plan === "team" || plan === "enterprise") && isPaidActive(billing?.status || "");
+  const opsQuery = useQuery({
+    queryKey: ["ops-summary-banner"],
+    queryFn: () =>
+      apiFetch<{
+        health_banner: string;
+      }>("/api/ops/summary"),
+    enabled: hasPaidSubscription,
+    refetchInterval: 30_000,
+    refetchIntervalInBackground: true,
+  });
   const slackStatusLabel = hasPaidSubscription
     ? slackConnected
       ? "Slack workspace connected"
@@ -226,6 +242,12 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
             ) : null}
           </div>
         </header>
+
+        {hasPaidSubscription && opsQuery.data?.health_banner ? (
+          <div className="border-b border-border/40 bg-amber-50 px-4 py-2 text-xs text-amber-950 lg:px-6">
+            {opsQuery.data.health_banner}
+          </div>
+        ) : null}
 
         <main className="flex-1 overflow-y-auto bg-muted/30 p-4 lg:p-6">{children}</main>
       </div>
