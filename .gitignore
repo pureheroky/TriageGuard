@@ -8,6 +8,7 @@ node_modules/
 coverage/
 dist/
 build/
+*.tsbuildinfo
 
 # Next.js
 apps/web/.next/
@@ -23,9 +24,13 @@ apps/web/out/
 
 # Go
 apps/api/bin/
+apps/api/server
 bin/
 *.test
 coverage.out
+
+# Supabase local CLI state
+supabase/.temp/
 
 # Logs
 *.log
